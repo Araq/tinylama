@@ -10,6 +10,21 @@ const
   blockQ3KSize* = 2 + (QK_K div 4) + (QK_K div 8) + 12  # d, qs, hmask, scales
   blockQ6KSize* = 2 + (QK_K div 16) + 3 * (QK_K div 4) # d, scales, ql+qh
 
+proc rowSizeQ2K*(rowLen: int): int =
+  if (rowLen mod QK_K) != 0:
+    raise newException(ValueError, "q2_K row size must be multiple of 256")
+  (rowLen div QK_K) * blockQ2KSize
+
+proc rowSizeQ3K*(rowLen: int): int =
+  if (rowLen mod QK_K) != 0:
+    raise newException(ValueError, "q3_K row size must be multiple of 256")
+  (rowLen div QK_K) * blockQ3KSize
+
+proc rowSizeQ6K*(rowLen: int): int =
+  if (rowLen mod QK_K) != 0:
+    raise newException(ValueError, "q6_K row size must be multiple of 256")
+  (rowLen div QK_K) * blockQ6KSize
+
 proc halfToFloat*(h: uint16): float32 =
   ## IEEE 754 half to float32.
   let s = (h shr 15) and 0x1
