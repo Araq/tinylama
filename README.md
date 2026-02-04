@@ -6,13 +6,21 @@ forward pass with greedy decoding.
 ## Build
 
 ```bash
-nim c -r main.nim models/TinyLlama-1.1B-Chat-v1.0.Q2_K.gguf "hello" --max-new 16
+nim c -r src/tinylama.nim models/TinyLlama-1.1B-Chat-v1.0.Q2_K.gguf "hello" --max-new 16
 ```
 
 Optional progress output:
 
 ```bash
-nim c -r main.nim models/TinyLlama-1.1B-Chat-v1.0.Q2_K.gguf "hello" --max-new 16 --progress
+nim c -r src/tinylama.nim models/TinyLlama-1.1B-Chat-v1.0.Q2_K.gguf "hello" --max-new 16 --progress
+```
+
+Optional Malebolgia parallelization (requires Malebolgia available to Nim):
+
+```bash
+nim c -r -d:useMalebolgia -d:ThreadPoolSize=8 -d:FixedChanSize=16 \
+  --path:/home/araq/projects/malebolgia/src \
+  src/tinylama.nim models/TinyLlama-1.1B-Chat-v1.0.Q2_K.gguf "hello" --max-new 16
 ```
 
 ## Download the tested model
@@ -35,7 +43,7 @@ curl -L -o models/TinyLlama-1.1B-Chat-v1.0.Q2_K.gguf \
 ## Example
 
 ```bash
-nim c -r main.nim models/TinyLlama-1.1B-Chat-v1.0.Q2_K.gguf \
+nim c -r src/tinylama.nim models/TinyLlama-1.1B-Chat-v1.0.Q2_K.gguf \
   "what is the capital of France?" --max-new 32
 ```
 

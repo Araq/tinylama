@@ -3,6 +3,8 @@
 import std/[math]
 import ./tensor
 import ./model
+when defined(useMalebolgia):
+  import malebolgia
 
 proc getTensorOr(m: var Model, a, b: string): Tensor =
   try:
@@ -46,14 +48,39 @@ proc linearGGMLCol(x: Tensor, w: Tensor): Tensor =
   if wCols != inDim:
     raise newException(ValueError, "linear: input dim mismatch")
   result = newTensor(@[wRows, seqLen])
-  for o in 0 ..< wRows:
-    let wRow = o * wCols
-    let outRow = o * seqLen
-    for s in 0 ..< seqLen:
-      var acc = 0.0'f32
-      for k in 0 ..< inDim:
-        acc += w.data[wRow + k] * x.data[k * seqLen + s]
-      result.data[outRow + s] = acc
+  when defined(useMalebolgia):
+    proc linearChunk(startRow, endRow: int,
+                     wData, xData, outData: ptr UncheckedArray[float32],
+                     wCols, seqLen: int) {.gcsafe.} =
+      for o in startRow ..< endRow:
+        let wRow = o * wCols
+        let outRow = o * seqLen
+        for s in 0 ..< seqLen:
+          var acc = 0.0'f32
+          for k in 0 ..< wCols:
+            acc += wData[wRow + k] * xData[k * seqLen + s]
+          outData[outRow + s] = acc
+
+    let wData = cast[ptr UncheckedArray[float32]](addr w.data[0])
+    let xData = cast[ptr UncheckedArray[float32]](addr x.data[0])
+    let outData = cast[ptr UncheckedArray[float32]](addr result.data[0])
+    let chunk = if wRows >= 64: 32 else: wRows
+    var m = createMaster()
+    m.awaitAll:
+      var start = 0
+      while start < wRows:
+        let stop = min(start + chunk, wRows)
+        m.spawn linearChunk(start, stop, wData, xData, outData, wCols, seqLen)
+        start = stop
+  else:
+    for o in 0 ..< wRows:
+      let wRow = o * wCols
+      let outRow = o * seqLen
+      for s in 0 ..< seqLen:
+        var acc = 0.0'f32
+        for k in 0 ..< inDim:
+          acc += w.data[wRow + k] * x.data[k * seqLen + s]
+        result.data[outRow + s] = acc
 
 type
   KvCache* = object

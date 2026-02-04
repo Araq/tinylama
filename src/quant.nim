@@ -184,4 +184,3 @@ proc dequantRowQ6K*(src: ptr UncheckedArray[byte], dst: ptr UncheckedArray[float
       qhOff += 32
       scOff += 8
     offset += blockQ6KSize
-
