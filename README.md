@@ -6,13 +6,13 @@ forward pass with greedy decoding.
 ## Build
 
 ```bash
-nim c -r main.nim models/TinyLlama-1.1B-Chat-v1.0.Q2_K.gguf "hello" 4
+nim c -r main.nim models/TinyLlama-1.1B-Chat-v1.0.Q2_K.gguf "hello" --max-new 16
 ```
 
 Optional progress output:
 
 ```bash
-nim c -r main.nim models/TinyLlama-1.1B-Chat-v1.0.Q2_K.gguf "hello" 4 --progress
+nim c -r main.nim models/TinyLlama-1.1B-Chat-v1.0.Q2_K.gguf "hello" --max-new 16 --progress
 ```
 
 ## Download the tested model
@@ -31,3 +31,16 @@ curl -L -o models/TinyLlama-1.1B-Chat-v1.0.Q2_K.gguf \
 - KV cache is enabled for decode steps to improve speed.
 - Only GGUF models with LLaMA architecture and supported quant types
   (Q2_K/Q3_K/Q6_K/F16/F32) are currently supported.
+
+## Example
+
+```bash
+nim c -r main.nim models/TinyLlama-1.1B-Chat-v1.0.Q2_K.gguf \
+  "what is the capital of France?" --max-new 32
+```
+
+Example output:
+
+```
+The capital of France is Paris.
+```

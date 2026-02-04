@@ -271,6 +271,11 @@ proc detokenize*(v: Vocab, tokens: seq[int32]): string =
   result = ""
   for t in tokens:
     let piece = tokenToPiece(v, t)
+    if t == v.bosId or t == v.eosId:
+      continue
+    if piece == "<s>" or piece == "</s>" or piece == "<|user|>" or
+       piece == "<|assistant|>" or piece == "<|system|>":
+      continue
     if piece.len == 6 and piece.startsWith("<0x") and piece.endsWith(">"):
       let hex = piece[3..4]
       try:
