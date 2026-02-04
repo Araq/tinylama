@@ -1,6 +1,6 @@
 ## Minimal tokenizer for GGUF models (SPM/LLaMA style).
 
-import std/[tables, heapqueue, strutils]
+import std/[tables, heapqueue, strutils, sequtils]
 import ./gguf_loader
 
 const
@@ -14,6 +14,7 @@ const
   tokenBosIdKey = "tokenizer.ggml.bos_token_id"
   tokenEosIdKey = "tokenizer.ggml.eos_token_id"
   tokenUnkIdKey = "tokenizer.ggml.unknown_token_id"
+  tokenChatTemplateKey = "tokenizer.chat_template"
 
 type
   TokenAttr* = enum
@@ -34,6 +35,7 @@ type
     eosId*: int32
     unkId*: int32
     modelType*: string
+    chatTemplate*: string
 
   Symbol = object
     prev, next: int
@@ -94,9 +96,11 @@ proc loadVocab*(g: GgufFile): Vocab =
   var addBos = false
   var addEos = false
   var addSpacePrefix = true
-  discard g.getKvBool(tokenAddBosKey, addBos)
+  let hasAddBos = g.getKvBool(tokenAddBosKey, addBos)
   discard g.getKvBool(tokenAddEosKey, addEos)
   discard g.getKvBool(tokenAddPrefixKey, addSpacePrefix)
+  if modelType == "llama" and not hasAddBos:
+    addBos = true
 
   var bosId: int32 = 1
   var eosId: int32 = 2
@@ -112,6 +116,7 @@ proc loadVocab*(g: GgufFile): Vocab =
   result.bosId = bosId
   result.eosId = eosId
   result.unkId = unkId
+  discard g.getKvStr(tokenChatTemplateKey, result.chatTemplate)
 
   result.tokens.setLen(tokenList.len)
   for i, tok in tokenList:
@@ -226,6 +231,36 @@ proc tokenize*(v: Vocab, text: string, addSpecial = true): seq[int32] =
   if addSpecial and v.addEos:
     result.add(v.eosId)
 
+proc tokenizeWithSpecial*(v: Vocab, text: string, addSpecial = true): seq[int32] =
+  var specials = @["<|user|>", "<|assistant|>", "<|system|>", "</s>", "<s>"]
+  specials = specials.filterIt(v.tokenToId.hasKey(it))
+  if specials.len == 0:
+    return tokenize(v, text, addSpecial)
+
+  var pos = 0
+  var outTokens: seq[int32] = @[]
+  while pos < text.len:
+    var bestIdx = -1
+    var bestTok = ""
+    for s in specials:
+      let i = text.find(s, pos)
+      if i >= 0 and (bestIdx == -1 or i < bestIdx):
+        bestIdx = i
+        bestTok = s
+    if bestIdx == -1:
+      outTokens.add(tokenizeSpm(v, text.substr(pos)))
+      break
+    if bestIdx > pos:
+      outTokens.add(tokenizeSpm(v, text.substr(pos, bestIdx - 1)))
+    outTokens.add(int32(v.tokenToId[bestTok]))
+    pos = bestIdx + bestTok.len
+
+  if addSpecial and v.addBos:
+    outTokens.insert(v.bosId, 0)
+  if addSpecial and v.addEos:
+    outTokens.add(v.eosId)
+  outTokens
+
 proc tokenToPiece*(v: Vocab, id: int32): string =
   let idx = int(id)
   if idx < 0 or idx >= v.tokens.len:
@@ -235,5 +270,23 @@ proc tokenToPiece*(v: Vocab, id: int32): string =
 proc detokenize*(v: Vocab, tokens: seq[int32]): string =
   result = ""
   for t in tokens:
-    result.add(tokenToPiece(v, t))
+    let piece = tokenToPiece(v, t)
+    if piece.len == 6 and piece.startsWith("<0x") and piece.endsWith(">"):
+      let hex = piece[3..4]
+      try:
+        let b = parseHexInt(hex)
+        result.add(char(b))
+      except ValueError:
+        result.add(piece)
+    else:
+      result.add(piece)
   result = result.replace("\xE2\x96\x81", " ")
+
+proc formatChatPrompt*(v: Vocab, userText: string): string =
+  ## Minimal support for the TinyLlama chat template pattern.
+  if v.chatTemplate.len == 0:
+    return userText
+  if v.chatTemplate.contains("<|user|>") and v.chatTemplate.contains("<|assistant|>"):
+    let eosPiece = tokenToPiece(v, v.eosId)
+    return "<|user|>\n" & userText & eosPiece & "<|assistant|>"
+  userText

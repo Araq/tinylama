@@ -94,6 +94,24 @@ proc rmsnorm*(x: Tensor, weight: Tensor, eps: float32): Tensor =
     for i in 0 ..< dim:
       result.data[base + i] = x.data[base + i] * inv * weight.data[i]
 
+proc rmsnormCols*(x: Tensor, weight: Tensor, eps: float32): Tensor =
+  ## Normalize over rows for each column (ggml column layout).
+  if x.shape.len != 2:
+    raise newException(ValueError, "rmsnormCols: expects 2D tensor")
+  if weight.shape.len != 1 or weight.shape[0] != x.shape[0]:
+    raise newException(ValueError, "rmsnormCols: weight shape mismatch")
+  let dim = x.shape[0]
+  let seqLen = x.shape[1]
+  result = newTensor(x.shape)
+  for s in 0 ..< seqLen:
+    var ss = 0.0'f32
+    for r in 0 ..< dim:
+      let v = x.data[r * seqLen + s]
+      ss += v * v
+    let inv = 1.0'f32 / sqrt(ss / float32(dim) + eps)
+    for r in 0 ..< dim:
+      result.data[r * seqLen + s] = x.data[r * seqLen + s] * inv * weight.data[r]
+
 proc softmaxLastDim*(x: Tensor): Tensor =
   if x.shape.len < 1:
     raise newException(ValueError, "softmax: empty shape")
