@@ -75,14 +75,20 @@ type
     tensors*: seq[GgufTensorInfo]
 
 when cpuEndian == littleEndian:
-  template fromLE(x: untyped): untyped = x
+  template fromLE*(x: untyped): untyped = x
 else:
-  proc fromLE(x: uint16): uint16 = swapEndian(x)
-  proc fromLE(x: uint32): uint32 = swapEndian(x)
-  proc fromLE(x: uint64): uint64 = swapEndian(x)
-  proc fromLE(x: int16): int16 = cast[int16](swapEndian(cast[uint16](x)))
-  proc fromLE(x: int32): int32 = cast[int32](swapEndian(cast[uint32](x)))
-  proc fromLE(x: int64): int64 = cast[int64](swapEndian(cast[uint64](x)))
+  proc fromLE*(x: uint16): uint16 =
+    swapEndian16(addr result, addr x)
+  proc fromLE*(x: uint32): uint32 =
+    swapEndian32(addr result, addr x)
+  proc fromLE*(x: uint64): uint64 =
+    swapEndian64(addr result, addr x)
+  proc fromLE*(x: int16): int16 =
+    swapEndian16(addr result, addr x)
+  proc fromLE*(x: int32): int32 =
+    swapEndian32(addr result, addr x)
+  proc fromLE*(x: int64): int64 =
+    swapEndian64(addr result, addr x)
 
 proc close*(g: var GgufFile) =
   memfiles.close(g.mem)

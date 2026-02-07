@@ -87,7 +87,7 @@ proc softmax*(t: GGTensor): GGTensor =
     let cpu = t.at.toCpu()
     result.at = cpu.softmax().toDevice()
 
-proc rmsnorm*(x: GGTensor, weight: GGTensor, eps: float32): GGTensor =
+proc rmsnorm*(x: GGTensor, weight: GGTensor, eps: float32, isGemma = false): GGTensor =
   let dim = x.shape[^1]
   let cpuX = x.at.toCpu()
   let cpuW = weight.at.toCpu()
@@ -96,10 +96,13 @@ proc rmsnorm*(x: GGTensor, weight: GGTensor, eps: float32): GGTensor =
     let row = cpuX[i, _].reshape(dim)
     let ss = (row *. row).sum()
     let inv = 1.0'f32 / sqrt(ss / float32(dim) + eps)
-    res[i, _] = (row *. (inv *. cpuW)).reshape(1, dim)
+    if isGemma:
+      res[i, _] = (row *. (inv *. (cpuW +. 1.0f))).reshape(1, dim)
+    else:
+      res[i, _] = (row *. (inv *. cpuW)).reshape(1, dim)
   result.at = res.toDevice()
 
-proc rmsnormCols*(x: GGTensor, weight: GGTensor, eps: float32): GGTensor =
+proc rmsnormCols*(x: GGTensor, weight: GGTensor, eps: float32, isGemma = false): GGTensor =
   let dim = x.shape[0]
   let seqLen = x.shape[1]
   let cpuX = x.at.toCpu()
@@ -109,7 +112,10 @@ proc rmsnormCols*(x: GGTensor, weight: GGTensor, eps: float32): GGTensor =
     let col = cpuX[_, s].reshape(dim)
     let ss = (col *. col).sum()
     let inv = 1.0'f32 / sqrt(ss / float32(dim) + eps)
-    res[_, s] = (col *. (inv *. cpuW)).reshape(dim, 1)
+    if isGemma:
+      res[_, s] = (col *. (inv *. (cpuW +. 1.0f))).reshape(dim, 1)
+    else:
+      res[_, s] = (col *. (inv *. cpuW)).reshape(dim, 1)
   result.at = res.toDevice()
 
 proc layernormCols*(x: GGTensor, weight: GGTensor, bias: GGTensor, eps: float32): GGTensor =

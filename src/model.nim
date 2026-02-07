@@ -3,6 +3,10 @@
 import std/[tables]
 when cpuEndian != littleEndian:
   import std/endians
+  proc fromLE(x: uint16): uint16 = swapEndian16(addr result, addr x)
+  proc fromLE(x: uint32): uint32 = swapEndian32(addr result, addr x)
+else:
+  template fromLE(x: untyped): untyped = x
 import arraymancer
 import ./gguf_loader
 import ./tensor
@@ -74,7 +78,7 @@ proc loadTensorF32(g: GgufFile, info: GgufTensorInfo): GGTensor =
     for i in 0 ..< count:
       var u: uint16
       copyMem(addr u, addr dataPtr[i * 2], 2)
-      when cpuEndian != littleEndian: u = swapEndian(u)
+      u = fromLE(u)
       dstPtr[i] = halfToFloat(u)
   of GGML_TYPE_Q4_0:
     let rowSize = rowSizeQ4_0(rowLen)
@@ -139,7 +143,10 @@ proc loadHParams(g: GgufFile): HParams =
   result.normType = "rms"
   result.ropeType = "llama"
 
-  if result.arch == "gemma" or result.arch == "gemma2":
+  if result.arch == "gemma":
+    result.actType = "gelu"
+    result.normType = "gemma"
+  elif result.arch == "gemma2":
     result.actType = "gelu"
     result.normType = "rms"
   elif result.arch == "phi3":

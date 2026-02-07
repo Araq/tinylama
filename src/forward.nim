@@ -91,7 +91,7 @@ proc forwardPrefill*(m: var Model, cache: var KvCache, tokens: seq[int32]): GGTe
     let wv = m.getTensor(prefix & "attn_v.weight")
     let wo = m.getTensor(prefix & "attn_output.weight")
 
-    let xNorm = rmsnormCols(x, norm, hp.rmsEps)
+    let xNorm = rmsnormCols(x, norm, hp.rmsEps, hp.normType == "gemma")
 
     var q = amMatmul(wq, xNorm)
     var k = amMatmul(wk, xNorm)
@@ -140,7 +140,7 @@ proc forwardPrefill*(m: var Model, cache: var KvCache, tokens: seq[int32]): GGTe
     let w2 = m.getTensor(prefix & "ffn_down.weight")
     let w3 = m.getTensor(prefix & "ffn_up.weight")
 
-    let xNorm2 = rmsnormCols(x, ffnNorm, hp.rmsEps)
+    let xNorm2 = rmsnormCols(x, ffnNorm, hp.rmsEps, hp.normType == "gemma")
     var g = amMatmul(w1, xNorm2)
     if hp.actType == "gelu":
       g = gelu(g)
@@ -153,7 +153,7 @@ proc forwardPrefill*(m: var Model, cache: var KvCache, tokens: seq[int32]): GGTe
   cache.curLen = tokens.len
   let normFinal = m.getTensor("output_norm.weight")
   let outW = m.getTensor("output.weight")
-  let xNormFinal = rmsnormCols(x, normFinal, hp.rmsEps)
+  let xNormFinal = rmsnormCols(x, normFinal, hp.rmsEps, hp.normType == "gemma")
   let logits = amMatmul(outW, xNormFinal)
 
   # Return only last token's logits
@@ -176,7 +176,7 @@ proc forwardNext*(m: var Model, cache: var KvCache, token: int32): GGTensor =
     let wv = m.getTensor(prefix & "attn_v.weight")
     let wo = m.getTensor(prefix & "attn_output.weight")
 
-    let xNorm = rmsnormCols(x, norm, hp.rmsEps)
+    let xNorm = rmsnormCols(x, norm, hp.rmsEps, hp.normType == "gemma")
     var q = amMatmul(wq, xNorm)
     var k = amMatmul(wk, xNorm)
     var v = amMatmul(wv, xNorm)
@@ -220,7 +220,7 @@ proc forwardNext*(m: var Model, cache: var KvCache, token: int32): GGTensor =
     let w2 = m.getTensor(prefix & "ffn_down.weight")
     let w3 = m.getTensor(prefix & "ffn_up.weight")
 
-    let xNorm2 = rmsnormCols(x, ffnNorm, hp.rmsEps)
+    let xNorm2 = rmsnormCols(x, ffnNorm, hp.rmsEps, hp.normType == "gemma")
     var g = amMatmul(w1, xNorm2)
     if hp.actType == "gelu":
       g = gelu(g)
@@ -233,5 +233,5 @@ proc forwardNext*(m: var Model, cache: var KvCache, token: int32): GGTensor =
   cache.curLen += 1
   let normFinal = m.getTensor("output_norm.weight")
   let outW = m.getTensor("output.weight")
-  let xNormFinal = rmsnormCols(x, normFinal, hp.rmsEps)
+  let xNormFinal = rmsnormCols(x, normFinal, hp.rmsEps, hp.normType == "gemma")
   result = amMatmul(outW, xNormFinal)

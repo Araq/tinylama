@@ -3,6 +3,8 @@
 import std/[math]
 when cpuEndian != littleEndian:
   import std/endians
+  proc swapEndian(x: uint16): uint16 = swapEndian16(addr result, addr x)
+  proc swapEndian(x: uint32): uint32 = swapEndian32(addr result, addr x)
 
 const
   QK_K* = 256

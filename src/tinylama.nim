@@ -1,4 +1,4 @@
-import std/[os, strutils, times, random, algorithm]
+import std/[strutils, times, random, algorithm, parseopt]
 import ./model
 import ./tokenizer
 import ./forward
@@ -70,13 +70,56 @@ proc sample(logits: GGTensor, s: Sampler): int =
   return pairs[0][1]
 
 proc main() =
-  if paramCount() < 1:
-    echo "Usage: tinylama <model.gguf> [prompt] [max-new-tokens]"
+  var modelPath = ""
+  var prompt = "Once upon a time"
+  var maxNew = 128
+  var temp = 0.8f
+  var topK = 40
+  var topP = 0.9f
+
+  var p = initOptParser()
+  var args: seq[string] = @[]
+  while true:
+    p.next()
+    case p.kind
+    of cmdEnd: break
+    of cmdShortOption, cmdLongOption:
+      let key = p.key
+      var val = p.val
+      if val == "":
+        p.next()
+        if p.kind == cmdArgument:
+          val = p.key
+        else:
+          # If next isn't an argument, we might have a flag without value
+          # but here all our options expect values.
+          discard
+
+      case key
+      of "max-new", "n":
+        if val != "": maxNew = parseInt(val)
+      of "temp", "t":
+        if val != "": temp = parseFloat(val)
+      of "top-k", "k":
+        if val != "": topK = parseInt(val)
+      of "top-p", "p":
+        if val != "": topP = parseFloat(val)
+      else: discard
+    of cmdArgument:
+      args.add(p.key)
+
+  if args.len < 1:
+    echo "Usage: tinylama [options] <model.gguf> [prompt]"
+    echo "Options:"
+    echo "  --max-new, -n:<int>   Max new tokens (default: 128)"
+    echo "  --temp, -t:<float>    Temperature (default: 0.8)"
+    echo "  --top-k, -k:<int>     Top-K (default: 40)"
+    echo "  --top-p, -p:<float>   Top-P (default: 0.9)"
     return
 
-  let modelPath = paramStr(1)
-  let prompt = if paramCount() >= 2: paramStr(2) else: "Once upon a time"
-  let maxNew = if paramCount() >= 3: parseInt(paramStr(3)) else: 128
+  modelPath = args[0]
+  if args.len >= 2:
+    prompt = args[1]
 
   randomize()
 
@@ -93,7 +136,7 @@ proc main() =
   echo "Prompt tokens: ", tokens
 
   var cache = initKvCache(m, 2048)
-  let sampler = Sampler(temp: 0.8f, topK: 40, topP: 0.9f)
+  let sampler = Sampler(temp: temp, topK: topK, topP: topP)
 
   echo "Prefill..."
   let startPrefill = cpuTime()
