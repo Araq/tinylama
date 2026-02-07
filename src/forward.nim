@@ -46,15 +46,16 @@ proc initKvCache*(hp: HParams, maxLen: int): KvCache =
     result.k[i] = newGGTensor(@[kvDim, maxLen])
     result.v[i] = newGGTensor(@[kvDim, maxLen])
 
-proc applyRopeSingle(x: var GGTensor, nHead, headDim, ropeDim: int, base: float32) =
+proc applyRopeInternal(x: var GGTensor, nHead, headDim, ropeDim: int, base: float32, startPos: int) =
   let xShape = x.shape
   let seqLen = xShape[1]
   var cpuX = x.at.toCpu()
   for h in 0 ..< nHead:
     for p in 0 ..< seqLen:
+      let pos = float32(startPos + p)
       for i in 0 ..< ropeDim div 2:
-        let theta = pow(1.0'f32 / base, float32(2 * i) / float32(ropeDim))
-        let angle = float32(p) * theta
+        let theta = pow(base, -float32(2 * i) / float32(ropeDim))
+        let angle = pos * theta
         let c = cos(angle)
         let s = sin(angle)
         let idx0 = h * headDim + 2 * i
@@ -65,23 +66,6 @@ proc applyRopeSingle(x: var GGTensor, nHead, headDim, ropeDim: int, base: float3
         cpuX[idx1, p] = v0 * s + v1 * c
   x.at = cpuX.toDevice()
 
-proc applyRopeAtPos(x: var GGTensor, nHead, headDim, ropeDim: int, base: float32, pos: int) =
-  var cpuX = x.at.toCpu()
-  let fpos = float32(pos)
-  for h in 0 ..< nHead:
-    for i in 0 ..< ropeDim div 2:
-      let theta = pow(1.0'f32 / base, float32(2 * i) / float32(ropeDim))
-      let angle = fpos * theta
-      let c = cos(angle)
-      let s = sin(angle)
-      let idx0 = h * headDim + 2 * i
-      let idx1 = h * headDim + 2 * i + 1
-      let v0 = cpuX[idx0, 0]
-      let v1 = cpuX[idx1, 0]
-      cpuX[idx0, 0] = v0 * c - v1 * s
-      cpuX[idx1, 0] = v0 * s + v1 * c
-  x.at = cpuX.toDevice()
-
 proc attentionFull(q, k, v, wo: GGTensor, nHead, nHeadKv, headDim: int): GGTensor =
   let seqLen = q.at.shape[1]
   let group = nHead div nHeadKv
@@ -90,20 +74,28 @@ proc attentionFull(q, k, v, wo: GGTensor, nHead, nHeadKv, headDim: int): GGTenso
   let kr = k.at.reshape(nHeadKv, headDim, seqLen)
   let vr = v.at.reshape(nHeadKv, headDim, seqLen)
 
+  # Moving to CPU for complex attention logic (masking + per-head)
   var outAttnCpu = newTensor[float32](nHead * headDim, seqLen)
+  let qrCpu = qr.toCpu()
+  let krCpu = kr.toCpu()
+  let vrCpu = vr.toCpu()
+
   for h in 0 ..< nHead:
     let kvh = h div group
-    let qh = qr[h, _, _].reshape(headDim, seqLen)
-    let kh = kr[kvh, _, _].reshape(headDim, seqLen)
-    let vh = vr[kvh, _, _].reshape(headDim, seqLen)
+    let qh = qrCpu[h, _, _].reshape(headDim, seqLen)
+    let kh = krCpu[kvh, _, _].reshape(headDim, seqLen)
+    let vh = vrCpu[kvh, _, _].reshape(headDim, seqLen)
 
-    let qhCpu = qh.toCpu()
-    let khCpu = kh.toCpu()
-    let vhCpu = vh.toCpu()
+    # scores = qh.T * kh / sqrt(headDim)
+    var scores = (qh.transpose() * kh) / sqrt(float32(headDim))
 
-    let scores = (qhCpu.transpose() * khCpu) / sqrt(float32(headDim))
+    # Causal Mask
+    for i in 0 ..< seqLen:
+      for j in i + 1 ..< seqLen:
+        scores[i, j] = -1e30'f32
+
     let scoresNorm = scores.softmax()
-    let res = vhCpu * scoresNorm.transpose()
+    let res = vh * scoresNorm.transpose()
     outAttnCpu[h * headDim ..< (h+1) * headDim, _] = res
 
   result = matmul(wo, outAttnCpu.toDevice().toGGTensor())
@@ -117,19 +109,19 @@ proc attentionCached(q: GGTensor, kCache, vCache: GGTensor, curLen, nHead, nHead
   let vr = vActive.reshape(nHeadKv, headDim, curLen)
 
   var outAttnCpu = newTensor[float32](nHead * headDim, 1)
+  let qrCpu = qr.toCpu()
+  let krCpu = kr.toCpu()
+  let vrCpu = vr.toCpu()
+
   for h in 0 ..< nHead:
     let kvh = h div group
-    let qh = qr[h, _, 0].reshape(headDim, 1)
-    let kh = kr[kvh, _, _].reshape(headDim, curLen)
-    let vh = vr[kvh, _, _].reshape(headDim, curLen)
+    let qh = qrCpu[h, _, 0].reshape(headDim, 1)
+    let kh = krCpu[kvh, _, _].reshape(headDim, curLen)
+    let vh = vrCpu[kvh, _, _].reshape(headDim, curLen)
 
-    let qhCpu = qh.toCpu()
-    let khCpu = kh.toCpu()
-    let vhCpu = vh.toCpu()
-
-    let scores = (qhCpu.transpose() * khCpu) / sqrt(float32(headDim))
+    let scores = (qh.transpose() * kh) / sqrt(float32(headDim))
     let scoresNorm = scores.softmax()
-    let res = vhCpu * scoresNorm.transpose()
+    let res = vh * scoresNorm.transpose()
     outAttnCpu[h * headDim ..< (h+1) * headDim, _] = res
   result = outAttnCpu.toDevice().toGGTensor()
 
@@ -162,14 +154,14 @@ proc forwardPrefill*(m: var Model, tokens: seq[int32], cache: var KvCache): GGTe
     let wDown = m.getTensor("blk." & $layer & ".ffn_down.weight")
 
     let xNorm = if hp.normType == "rms": rmsnormCols(x, attnNorm, hp.rmsEps)
-                else: rmsnormCols(x, attnNorm, hp.rmsEps)
+                else: rmsnormCols(x, attnNorm, hp.rmsEps) # Fallback to RMS
 
     var q = linearGGMLCol(xNorm, wq)
     var k = linearGGMLCol(xNorm, wk)
     let v = linearGGMLCol(xNorm, wv)
 
-    applyRopeSingle(q, hp.nHead, headDim, ropeDim, hp.ropeFreqBase)
-    applyRopeSingle(k, hp.nHeadKv, headDim, ropeDim, hp.ropeFreqBase)
+    applyRopeInternal(q, hp.nHead, headDim, ropeDim, hp.ropeFreqBase, 0)
+    applyRopeInternal(k, hp.nHeadKv, headDim, ropeDim, hp.ropeFreqBase, 0)
 
     cache.k[layer].at[_, 0 ..< tokens.len] = k.at
     cache.v[layer].at[_, 0 ..< tokens.len] = v.at
@@ -213,8 +205,8 @@ proc forwardDecode*(m: var Model, token: int32, cache: var KvCache): GGTensor =
     var k = linearGGMLCol(xNorm, wk)
     let v = linearGGMLCol(xNorm, wv)
 
-    applyRopeAtPos(q, hp.nHead, headDim, ropeDim, hp.ropeFreqBase, pos)
-    applyRopeAtPos(k, hp.nHeadKv, headDim, ropeDim, hp.ropeFreqBase, pos)
+    applyRopeInternal(q, hp.nHead, headDim, ropeDim, hp.ropeFreqBase, pos)
+    applyRopeInternal(k, hp.nHeadKv, headDim, ropeDim, hp.ropeFreqBase, pos)
 
     cache.k[layer].at[_, pos] = k.at[_, 0]
     cache.v[layer].at[_, pos] = v.at[_, 0]

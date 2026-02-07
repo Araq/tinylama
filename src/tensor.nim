@@ -4,10 +4,8 @@ import std/[math]
 import arraymancer
 
 when defined(cuda):
-  import arraymancer/tensor/backend/cuda
   type DeviceTensor* = CudaTensor[float32]
 elif defined(opencl):
-  import arraymancer/tensor/backend/opencl
   type DeviceTensor* = ClTensor[float32]
 else:
   type DeviceTensor* = arraymancer.Tensor[float32]
@@ -69,16 +67,25 @@ proc gelu*(a: GGTensor): GGTensor =
     result.at = res.toDevice()
 
 proc matmul*(a, b: GGTensor): GGTensor =
-  # Arraymancer's * handles matrix-matrix and matrix-vector correctly
-  result.at = a.at * b.at
+  # Robust matmul that handles transposed weights often found in GGUF
+  let sA = a.at.shape
+  let sB = b.at.shape
+  if sA[^1] == sB[0]:
+    result.at = a.at * b.at
+  elif sA[0] == sB[0]:
+    result.at = a.at.transpose() * b.at
+  elif sA[^1] == sB[^1]:
+    result.at = a.at * b.at.transpose()
+  else:
+    # Fallback to standard multiplication, which will likely throw a descriptive error if shapes are wrong
+    result.at = a.at * b.at
 
 proc softmax*(t: GGTensor): GGTensor =
   when DeviceTensor is arraymancer.Tensor[float32]:
     result.at = t.at.softmax()
   else:
     let cpu = t.at.toCpu()
-    let res = cpu.softmax()
-    result.at = res.toDevice()
+    result.at = cpu.softmax().toDevice()
 
 proc rmsnorm*(x: GGTensor, weight: GGTensor, eps: float32): GGTensor =
   let dim = x.shape[^1]
@@ -120,8 +127,3 @@ proc layernormCols*(x: GGTensor, weight: GGTensor, bias: GGTensor, eps: float32)
     let inv = 1.0'f32 / sqrt(variance + eps)
     res[_, s] = ((diff *. inv) *. cpuW +. cpuB).reshape(dim, 1)
   result.at = res.toDevice()
-
-proc ropeInplace*(x: var GGTensor, base: float32, startPos = 0) =
-  # Logic moved to forward.nim for better control
-  var cpuX = x.at.toCpu()
-  x.at = cpuX.toDevice()
