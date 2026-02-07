@@ -12,7 +12,10 @@ const
   GGML_TYPE_F32 = 0
   GGML_TYPE_F16 = 1
   GGML_TYPE_Q4_0 = 2
-  GGML_TYPE_Q8_0 = 7
+  GGML_TYPE_Q4_1 = 3
+  GGML_TYPE_Q5_0 = 6
+  GGML_TYPE_Q5_1 = 7
+  GGML_TYPE_Q8_0 = 8
   GGML_TYPE_Q2_K = 10
   GGML_TYPE_Q3_K = 11
   GGML_TYPE_Q4_K = 12
@@ -45,22 +48,15 @@ type
 
 proc tensorElemCount(info: GgufTensorInfo): int =
   var n = 1'u64
-  for i in 0 ..< int(info.nDims):
-    n *= info.ne[i]
-  if n > uint64(high(int)):
-    raise newException(ValueError, "tensor too large")
+  for i in 0 ..< int(info.nDims): n *= info.ne[i]
+  if n > uint64(high(int)): raise newException(ValueError, "tensor too large")
   int(n)
 
 proc tensorShape(info: GgufTensorInfo): seq[int] =
-  # Reverse dimensions for Arraymancer (contiguous dim last in GGUF, first in Arraymancer rows)
-  # Actually GGUF dim0 is most contiguous. Arraymancer last dim is most contiguous.
-  # So we should reverse.
   result = @[]
-  if info.nDims == 0:
-    result = @[1]
+  if info.nDims == 0: result = @[1]
   else:
-    for i in countdown(int(info.nDims) - 1, 0):
-      result.add(int(info.ne[i]))
+    for i in countdown(int(info.nDims) - 1, 0): result.add(int(info.ne[i]))
 
 proc loadTensorF32(g: GgufFile, info: GgufTensorInfo): GGTensor =
   let count = tensorElemCount(info)
@@ -75,52 +71,40 @@ proc loadTensorF32(g: GgufFile, info: GgufTensorInfo): GGTensor =
     copyMem(dstPtr, dataPtr, count * 4)
   of GGML_TYPE_F16:
     for i in 0 ..< count:
-      var u = cast[ptr UncheckedArray[uint16]](addr dataPtr[i * 2])[0]
-      when cpuEndian != littleEndian:
-        u = swapEndian(u)
+      var u: uint16
+      copyMem(addr u, addr dataPtr[i * 2], 2)
+      when cpuEndian != littleEndian: u = swapEndian(u)
       dstPtr[i] = halfToFloat(u)
   of GGML_TYPE_Q4_0:
     let rowSize = rowSizeQ4_0(rowLen)
-    for r in 0 ..< rows:
-      let src = cast[ptr UncheckedArray[byte]](addr dataPtr[r * rowSize])
-      let dst = cast[ptr UncheckedArray[float32]](addr dstPtr[r * rowLen])
-      dequantRowQ4_0(src, dst, rowLen)
+    for r in 0 ..< rows: dequantRowQ4_0(cast[ptr UncheckedArray[byte]](addr dataPtr[r * rowSize]), cast[ptr UncheckedArray[float32]](addr dstPtr[r * rowLen]), rowLen)
+  of GGML_TYPE_Q4_1:
+    let rowSize = rowSizeQ4_1(rowLen)
+    for r in 0 ..< rows: dequantRowQ4_1(cast[ptr UncheckedArray[byte]](addr dataPtr[r * rowSize]), cast[ptr UncheckedArray[float32]](addr dstPtr[r * rowLen]), rowLen)
+  of GGML_TYPE_Q5_0:
+    let rowSize = rowSizeQ5_0(rowLen)
+    for r in 0 ..< rows: dequantRowQ5_0(cast[ptr UncheckedArray[byte]](addr dataPtr[r * rowSize]), cast[ptr UncheckedArray[float32]](addr dstPtr[r * rowLen]), rowLen)
+  of GGML_TYPE_Q5_1:
+    let rowSize = rowSizeQ5_1(rowLen)
+    for r in 0 ..< rows: dequantRowQ5_1(cast[ptr UncheckedArray[byte]](addr dataPtr[r * rowSize]), cast[ptr UncheckedArray[float32]](addr dstPtr[r * rowLen]), rowLen)
   of GGML_TYPE_Q8_0:
     let rowSize = rowSizeQ8_0(rowLen)
-    for r in 0 ..< rows:
-      let src = cast[ptr UncheckedArray[byte]](addr dataPtr[r * rowSize])
-      let dst = cast[ptr UncheckedArray[float32]](addr dstPtr[r * rowLen])
-      dequantRowQ8_0(src, dst, rowLen)
+    for r in 0 ..< rows: dequantRowQ8_0(cast[ptr UncheckedArray[byte]](addr dataPtr[r * rowSize]), cast[ptr UncheckedArray[float32]](addr dstPtr[r * rowLen]), rowLen)
   of GGML_TYPE_Q2_K:
     let rowSize = rowSizeQ2K(rowLen)
-    for r in 0 ..< rows:
-      let src = cast[ptr UncheckedArray[byte]](addr dataPtr[r * rowSize])
-      let dst = cast[ptr UncheckedArray[float32]](addr dstPtr[r * rowLen])
-      dequantRowQ2K(src, dst, rowLen)
+    for r in 0 ..< rows: dequantRowQ2K(cast[ptr UncheckedArray[byte]](addr dataPtr[r * rowSize]), cast[ptr UncheckedArray[float32]](addr dstPtr[r * rowLen]), rowLen)
   of GGML_TYPE_Q3_K:
     let rowSize = rowSizeQ3K(rowLen)
-    for r in 0 ..< rows:
-      let src = cast[ptr UncheckedArray[byte]](addr dataPtr[r * rowSize])
-      let dst = cast[ptr UncheckedArray[float32]](addr dstPtr[r * rowLen])
-      dequantRowQ3K(src, dst, rowLen)
+    for r in 0 ..< rows: dequantRowQ3K(cast[ptr UncheckedArray[byte]](addr dataPtr[r * rowSize]), cast[ptr UncheckedArray[float32]](addr dstPtr[r * rowLen]), rowLen)
   of GGML_TYPE_Q4_K:
     let rowSize = rowSizeQ4K(rowLen)
-    for r in 0 ..< rows:
-      let src = cast[ptr UncheckedArray[byte]](addr dataPtr[r * rowSize])
-      let dst = cast[ptr UncheckedArray[float32]](addr dstPtr[r * rowLen])
-      dequantRowQ4K(src, dst, rowLen)
+    for r in 0 ..< rows: dequantRowQ4K(cast[ptr UncheckedArray[byte]](addr dataPtr[r * rowSize]), cast[ptr UncheckedArray[float32]](addr dstPtr[r * rowLen]), rowLen)
   of GGML_TYPE_Q5_K:
     let rowSize = rowSizeQ5K(rowLen)
-    for r in 0 ..< rows:
-      let src = cast[ptr UncheckedArray[byte]](addr dataPtr[r * rowSize])
-      let dst = cast[ptr UncheckedArray[float32]](addr dstPtr[r * rowLen])
-      dequantRowQ5K(src, dst, rowLen)
+    for r in 0 ..< rows: dequantRowQ5K(cast[ptr UncheckedArray[byte]](addr dataPtr[r * rowSize]), cast[ptr UncheckedArray[float32]](addr dstPtr[r * rowLen]), rowLen)
   of GGML_TYPE_Q6_K:
     let rowSize = rowSizeQ6K(rowLen)
-    for r in 0 ..< rows:
-      let src = cast[ptr UncheckedArray[byte]](addr dataPtr[r * rowSize])
-      let dst = cast[ptr UncheckedArray[float32]](addr dstPtr[r * rowLen])
-      dequantRowQ6K(src, dst, rowLen)
+    for r in 0 ..< rows: dequantRowQ6K(cast[ptr UncheckedArray[byte]](addr dataPtr[r * rowSize]), cast[ptr UncheckedArray[float32]](addr dstPtr[r * rowLen]), rowLen)
   else:
     raise newException(ValueError, "unsupported ggml type: " & $info.elemType)
 
