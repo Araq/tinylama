@@ -52,11 +52,14 @@ proc sample(logits: GGTensor, nVocab: int, temperature: float32 = 0.0, topP: flo
 
   # Apply Top-K
   if topK > 0 and topK < nVocab:
+    # Partial sort to get topK elements would be better, but Nim doesn't have it in stdlib.
+    # We sort the whole thing for now, but only if topK is reasonably small or if Top-P is also used.
     probs.sort(proc (a, b: TokenProb): int = cmp(b.p, a.p))
     for i in topK ..< nVocab: probs[i].p = 0.0
     var newSum = 0.0'f32
     for i in 0 ..< topK: newSum += probs[i].p
-    for i in 0 ..< topK: probs[i].p /= newSum
+    if newSum > 0:
+      for i in 0 ..< topK: probs[i].p /= newSum
 
   # Apply Top-P
   if topP < 1.0:

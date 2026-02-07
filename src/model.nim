@@ -58,11 +58,12 @@ proc tensorShape(info: GgufTensorInfo): seq[int] =
 
 proc loadTensorF32(g: GgufFile, info: GgufTensorInfo): GGTensor =
   let count = tensorElemCount(info)
-  result = newGGTensor(tensorShape(info))
+  let shape = tensorShape(info)
+  var cpuAt = newTensor[float32](shape)
   let dataPtr = tensorDataPtr(g, info)
   let rowLen = int(info.ne[0])
   let rows = if rowLen > 0: count div rowLen else: 0
-  let dstPtr = cast[ptr UncheckedArray[float32]](arraymancer.get_data_ptr(result.at))
+  let dstPtr = cast[ptr UncheckedArray[float32]](cpuAt.get_data_ptr())
   case info.elemType
   of GGML_TYPE_F32:
     copyMem(dstPtr, dataPtr, count * 4)
@@ -116,6 +117,10 @@ proc loadTensorF32(g: GgufFile, info: GgufTensorInfo): GGTensor =
       dequantRowQ6K(src, dst, rowLen)
   else:
     raise newException(ValueError, "unsupported ggml type: " & $info.elemType)
+
+  when defined(cuda): result.at = cpuAt.cuda()
+  elif defined(opencl): result.at = cpuAt.opencl()
+  else: result.at = cpuAt
 
 proc loadHParams(g: GgufFile): HParams =
   discard g.getKvStr("general.architecture", result.arch)
