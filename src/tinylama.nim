@@ -1,42 +1,91 @@
 ## Minimal CLI example: load GGUF and tokenize a prompt.
 
-import std/[os, strutils]
+import std/[os, strutils, math, algorithm, random]
+import arraymancer
 import ./gguf_loader
 import ./tokenizer
 import ./model
 import ./forward
 import ./tensor
 
-proc argmaxLast(logits: Tensor, nVocab: int): int32 =
-  if logits.shape.len != 2:
-    raise newException(ValueError, "logits must be 2D")
-  if logits.shape[0] == nVocab:
-    let seqLen = logits.shape[1]
-    let col = seqLen - 1
+proc sample(logits: GGTensor, nVocab: int, temperature: float32 = 0.0, topP: float32 = 1.0, topK: int = 50): int32 =
+  let lshape = logits.shape
+  let seqLen = if lshape[0] == nVocab: lshape[1] else: lshape[0]
+
+  var vals = newSeq[float32](nVocab)
+  if lshape[0] == nVocab:
+    for i in 0 ..< nVocab: vals[i] = logits.at[i, seqLen - 1]
+  else:
+    for i in 0 ..< nVocab: vals[i] = logits.at[seqLen - 1, i]
+
+  if temperature <= 0.0:
     var bestIdx = 0
-    var bestVal = logits.data[col]
+    var bestVal = vals[0]
     for i in 1 ..< nVocab:
-      let v = logits.data[i * seqLen + col]
-      if v > bestVal:
-        bestVal = v
+      if vals[i] > bestVal:
+        bestVal = vals[i]
         bestIdx = i
     return int32(bestIdx)
-  if logits.shape[1] == nVocab:
-    let seqLen = logits.shape[0]
-    let base = (seqLen - 1) * nVocab
-    var bestIdx = 0
-    var bestVal = logits.data[base]
-    for i in 1 ..< nVocab:
-      let v = logits.data[base + i]
-      if v > bestVal:
-        bestVal = v
-        bestIdx = i
-    return int32(bestIdx)
-  raise newException(ValueError, "logits shape mismatch for vocab")
+
+  var maxLogit = vals[0]
+  for i in 1 ..< nVocab: maxLogit = max(maxLogit, vals[i])
+  var sumExp = 0.0'f32
+  for i in 0 ..< nVocab:
+    vals[i] = exp((vals[i] - maxLogit) / temperature)
+    sumExp += vals[i]
+  for i in 0 ..< nVocab: vals[i] /= sumExp
+
+  type TokenProb = object
+    id: int32
+    p: float32
+  var probs = newSeq[TokenProb](nVocab)
+  for i in 0 ..< nVocab: probs[i] = TokenProb(id: int32(i), p: vals[i])
+
+  # Apply Top-K
+  if topK > 0 and topK < nVocab:
+    probs.sort(proc (a, b: TokenProb): int = cmp(b.p, a.p))
+    for i in topK ..< nVocab: probs[i].p = 0.0
+    var newSum = 0.0'f32
+    for i in 0 ..< topK: newSum += probs[i].p
+    for i in 0 ..< topK: probs[i].p /= newSum
+
+  # Apply Top-P
+  if topP < 1.0:
+    if topK <= 0 or topK >= nVocab:
+      probs.sort(proc (a, b: TokenProb): int = cmp(b.p, a.p))
+    var cumulativeP = 0.0'f32
+    var lastIdx = nVocab - 1
+    for i in 0 ..< nVocab:
+      cumulativeP += probs[i].p
+      if cumulativeP >= topP:
+        lastIdx = i
+        break
+    var newSum = 0.0'f32
+    for i in 0 .. lastIdx: newSum += probs[i].p
+    let r = rand(newSum)
+    var cur = 0.0'f32
+    for i in 0 .. lastIdx:
+      cur += probs[i].p
+      if r <= cur: return probs[i].id
+    return probs[0].id
+
+  let r = rand(1.0'f32)
+  var cur = 0.0'f32
+  for i in 0 ..< probs.len:
+    cur += probs[i].p
+    if r <= cur: return probs[i].id
+  return probs[^1].id
 
 proc main() =
+  randomize()
   if paramCount() < 1:
-    echo "usage: tinylama <model.gguf> [prompt] [--max-new N] [--progress]"
+    echo "usage: tinylama <model.gguf> [prompt] [options]"
+    echo "options:"
+    echo "  --max-new N      Max new tokens (default: 16)"
+    echo "  --temp T         Temperature (default: 0.0, greedy)"
+    echo "  --top-p P        Top-P sampling (default: 1.0)"
+    echo "  --top-k K        Top-K sampling (default: 50)"
+    echo "  --progress       Show generation progress"
     quit(1)
 
   let modelPath = paramStr(1)
@@ -46,7 +95,10 @@ proc main() =
     prompt = paramStr(2)
     startIdx = 3
 
-  var maxNew = 4
+  var maxNew = 16
+  var temp: float32 = 0.0
+  var topP: float32 = 1.0
+  var topK = 50
   var showProgress = false
   var i = startIdx
   while i <= paramCount():
@@ -55,6 +107,15 @@ proc main() =
       showProgress = true
     elif arg == "--max-new" and i + 1 <= paramCount():
       maxNew = parseInt(paramStr(i + 1))
+      inc i
+    elif arg == "--temp" and i + 1 <= paramCount():
+      temp = parseFloat(paramStr(i + 1)).float32
+      inc i
+    elif arg == "--top-p" and i + 1 <= paramCount():
+      topP = parseFloat(paramStr(i + 1)).float32
+      inc i
+    elif arg == "--top-k" and i + 1 <= paramCount():
+      topK = parseInt(paramStr(i + 1))
       inc i
     else:
       echo "unknown arg: ", arg
@@ -82,31 +143,31 @@ proc main() =
       if showProgress: stderr.write("prefill... ")
       let logits0 = forwardPrefill(m, allTokens, cache)
       if showProgress: stderr.writeLine("done")
-      var next = argmaxLast(logits0, nVocab)
+      var next = sample(logits0, nVocab, temp, topP, topK)
       allTokens.add(next)
       stdout.write(detokenize(vocab, @[next]))
       stdout.flushFile()
       for j in 1 ..< maxNew:
         if showProgress: stderr.write("decode ", $j, "/", $maxNew, "... ")
         let logits = forwardDecode(m, next, cache)
-        next = argmaxLast(logits, nVocab)
+        next = sample(logits, nVocab, temp, topP, topK)
         allTokens.add(next)
         stdout.write(detokenize(vocab, @[next]))
         stdout.flushFile()
         if showProgress: stderr.writeLine("tok=" & $next)
       stdout.write("\n")
     else:
-      var lastLogits: Tensor
+      var lastLogits: GGTensor
       for t in tokens:
         lastLogits = forwardDecode(m, t, cache)
-      var next = argmaxLast(lastLogits, nVocab)
+      var next = sample(lastLogits, nVocab, temp, topP, topK)
       allTokens.add(next)
       stdout.write(detokenize(vocab, @[next]))
       stdout.flushFile()
       for j in 1 ..< maxNew:
         if showProgress: stderr.write("decode ", $j, "/", $maxNew, "... ")
         let logits = forwardDecode(m, next, cache)
-        next = argmaxLast(logits, nVocab)
+        next = sample(logits, nVocab, temp, topP, topK)
         allTokens.add(next)
         stdout.write(detokenize(vocab, @[next]))
         stdout.flushFile()

@@ -78,8 +78,14 @@ proc byteToToken(v: Vocab, ch: byte): int32 =
 proc loadVocab*(g: GgufFile): Vocab =
   var modelType: string
   discard g.getKvStr(tokenModelKey, modelType)
+  var arch: string
+  discard g.getKvStr("general.architecture", arch)
+  let p = if arch.len > 0: arch & "." else: "llama."
+
   var tokenList: seq[string]
-  let okTokens = g.getKvArrStr(tokenListKey, tokenList)
+  var okTokens = g.getKvArrStr(tokenListKey, tokenList)
+  if not okTokens and arch.len > 0:
+    okTokens = g.getKvArrStr("tokenizer.ggml.tokens", tokenList)
   if not okTokens:
     raise newException(IOError, "tokenizer tokens missing")
 
@@ -96,18 +102,18 @@ proc loadVocab*(g: GgufFile): Vocab =
   var addBos = false
   var addEos = false
   var addSpacePrefix = true
-  let hasAddBos = g.getKvBool(tokenAddBosKey, addBos)
-  discard g.getKvBool(tokenAddEosKey, addEos)
-  discard g.getKvBool(tokenAddPrefixKey, addSpacePrefix)
-  if modelType == "llama" and not hasAddBos:
+  let hasAddBos = g.getKvBool(p & "tokenizer.add_bos_token", addBos) or g.getKvBool(tokenAddBosKey, addBos)
+  discard g.getKvBool(p & "tokenizer.add_eos_token", addEos) or g.getKvBool(tokenAddEosKey, addEos)
+  discard g.getKvBool(p & "tokenizer.add_space_prefix", addSpacePrefix) or g.getKvBool(tokenAddPrefixKey, addSpacePrefix)
+  if (modelType == "llama" or arch == "llama") and not hasAddBos:
     addBos = true
 
   var bosId: int32 = 1
   var eosId: int32 = 2
   var unkId: int32 = 0
-  discard g.getKvI32(tokenBosIdKey, bosId)
-  discard g.getKvI32(tokenEosIdKey, eosId)
-  discard g.getKvI32(tokenUnkIdKey, unkId)
+  discard g.getKvI32(p & "tokenizer.bos_token_id", bosId) or g.getKvI32(tokenBosIdKey, bosId)
+  discard g.getKvI32(p & "tokenizer.eos_token_id", eosId) or g.getKvI32(tokenEosIdKey, eosId)
+  discard g.getKvI32(p & "tokenizer.unknown_token_id", unkId) or g.getKvI32(tokenUnkIdKey, unkId)
 
   result.modelType = modelType
   result.addBos = addBos
