@@ -71,7 +71,7 @@ proc layernormCols*(x: GGTensor, weight: GGTensor, bias: GGTensor, eps: float32)
   for s in 0 ..< seqLen:
     let col = x.at[_, s].reshape(dim)
     let mean = col.mean()
-    let diff = col - mean
+    let diff = col -. mean
     let variance = (diff * diff).mean()
     let inv = 1.0'f32 / sqrt(variance + eps)
     result.at[_, s] = ((diff * inv) * weight.at + bias.at).reshape(dim, 1)

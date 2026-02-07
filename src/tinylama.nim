@@ -41,6 +41,15 @@ proc sample(logits: GGTensor, nVocab: int, temperature: float32 = 0.0, topP: flo
   var probs = newSeq[TokenProb](nVocab)
   for i in 0 ..< nVocab: probs[i] = TokenProb(id: int32(i), p: vals[i])
 
+  # If we don't need topK or topP, just sample multinomial directly to save time
+  if (topK <= 0 or topK >= nVocab) and topP >= 1.0:
+    let r = rand(1.0'f32)
+    var cur = 0.0'f32
+    for i in 0 ..< nVocab:
+      cur += vals[i]
+      if r <= cur: return int32(i)
+    return int32(nVocab - 1)
+
   # Apply Top-K
   if topK > 0 and topK < nVocab:
     probs.sort(proc (a, b: TokenProb): int = cmp(b.p, a.p))
@@ -69,6 +78,7 @@ proc sample(logits: GGTensor, nVocab: int, temperature: float32 = 0.0, topP: flo
       if r <= cur: return probs[i].id
     return probs[0].id
 
+  # Final fallback multinomial
   let r = rand(1.0'f32)
   var cur = 0.0'f32
   for i in 0 ..< probs.len:

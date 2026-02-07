@@ -13,9 +13,13 @@ proc getTensorOr(m: var Model, a, b: string): GGTensor =
 
 proc embeddingLookup(weight: GGTensor, tokens: seq[int32], nVocab, nEmb: int): GGTensor =
   result = newGGTensor(@[nEmb, tokens.len])
+  let wShape = weight.shape
   for i, t in tokens:
     let tid = int(t)
-    result.at[_, i] = weight.at[tid, _].reshape(nEmb, 1)
+    if wShape[0] == nVocab:
+      result.at[_, i] = weight.at[tid, _].reshape(nEmb, 1)
+    else:
+      result.at[_, i] = weight.at[_, tid].reshape(nEmb, 1)
 
 proc linearGGMLCol(x: GGTensor, w: GGTensor): GGTensor =
   result = matmul(w, x)
@@ -58,16 +62,20 @@ proc applyRopeSingle(x: var GGTensor, nHead, headDim, ropeDim: int, base: float3
 
 proc applyRopeAtPos(x: var GGTensor, nHead, headDim, ropeDim: int, base: float32, pos: int) =
   let fpos = float32(pos)
+  let xShape = x.shape
+  let isSeqFirst = xShape[1] == 1 # Assuming [dim, 1]
   for h in 0 ..< nHead:
     for i in 0 ..< ropeDim div 2:
       let theta = pow(1.0'f32 / base, float32(2 * i) / float32(ropeDim))
       let angle = fpos * theta
       let c = cos(angle)
       let s = sin(angle)
-      let v0 = x.at[h * headDim + 2 * i, 0]
-      let v1 = x.at[h * headDim + 2 * i + 1, 0]
-      x.at[h * headDim + 2 * i, 0] = v0 * c - v1 * s
-      x.at[h * headDim + 2 * i + 1, 0] = v0 * s + v1 * c
+      let idx0 = h * headDim + 2 * i
+      let idx1 = h * headDim + 2 * i + 1
+      let v0 = x.at[idx0, 0]
+      let v1 = x.at[idx1, 0]
+      x.at[idx0, 0] = v0 * c - v1 * s
+      x.at[idx1, 0] = v0 * s + v1 * c
 
 proc amMatmul(a, b: arraymancer.Tensor[float32]): arraymancer.Tensor[float32] =
   result = newTensor[float32](@[a.shape[0], b.shape[1]])
