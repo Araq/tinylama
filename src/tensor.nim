@@ -127,3 +127,18 @@ proc layernormCols*(x: GGTensor, weight: GGTensor, bias: GGTensor, eps: float32)
     let inv = 1.0'f32 / sqrt(variance + eps)
     res[_, s] = ((diff *. inv) *. cpuW +. cpuB).reshape(dim, 1)
   result.at = res.toDevice()
+
+proc amMatmul*(a, b: GGTensor): GGTensor =
+  # a is [out, in], b is [in, seq]
+  # result is [out, seq]
+  result.at = a.at * b.at
+
+proc embeddingLookup*(weight: GGTensor, ids: seq[int]): GGTensor =
+  let nEmb = weight.at.shape[1]
+  let nVocab = weight.at.shape[0]
+  var res = newTensor[float32](nEmb, ids.len)
+  let cpuW = weight.at.toCpu()
+  for i, id in ids:
+    if id >= 0 and id < nVocab:
+      res[_, i] = cpuW[id, _].reshape(nEmb, 1)
+  result.at = res.toDevice()

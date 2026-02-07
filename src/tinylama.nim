@@ -1,206 +1,115 @@
-## Minimal CLI example: load GGUF and tokenize a prompt.
-
-import std/[os, strutils, math, algorithm, random]
-import arraymancer
-import ./gguf_loader
-import ./tokenizer
+import std/[os, strutils, times, random, algorithm]
 import ./model
+import ./tokenizer
 import ./forward
 import ./tensor
+import arraymancer
 
-proc sample(logits: GGTensor, nVocab: int, temperature: float32 = 0.0, topP: float32 = 1.0, topK: int = 50): int32 =
-  let lshape = logits.shape
-  let seqLen = if lshape[0] == nVocab: lshape[1] else: lshape[0]
+type
+  Sampler = object
+    temp: float32
+    topK: int
+    topP: float32
 
-  let cpuLogits = logits.at.toCpu()
-  var vals = newSeq[float32](nVocab)
-  if lshape[0] == nVocab:
-    for i in 0 ..< nVocab: vals[i] = cpuLogits[i, seqLen - 1]
-  else:
-    for i in 0 ..< nVocab: vals[i] = cpuLogits[seqLen - 1, i]
+proc sample(logits: GGTensor, s: Sampler): int =
+  var tmpCpu = logits.at.toCpu()
+  let n = tmpCpu.shape[0]
 
-  if temperature <= 0.0:
-    var bestIdx = 0
-    var bestVal = vals[0]
-    for i in 1 ..< nVocab:
-      if vals[i] > bestVal:
-        bestVal = vals[i]
-        bestIdx = i
-    return int32(bestIdx)
+  if s.temp > 0:
+    for i in 0 ..< n:
+      tmpCpu[i, 0] /= s.temp
 
-  var maxLogit = vals[0]
-  for i in 1 ..< nVocab: maxLogit = max(maxLogit, vals[i])
-  var sumExp = 0.0'f32
-  for i in 0 ..< nVocab:
-    vals[i] = exp((vals[i] - maxLogit) / temperature)
-    sumExp += vals[i]
-  for i in 0 ..< nVocab: vals[i] /= sumExp
+  # Softmax
+  var maxL = tmpCpu[0, 0]
+  for i in 1 ..< n:
+    if tmpCpu[i, 0] > maxL: maxL = tmpCpu[i, 0]
 
-  type TokenProb = object
-    id: int32
-    p: float32
-  var probs = newSeq[TokenProb](nVocab)
-  for i in 0 ..< nVocab: probs[i] = TokenProb(id: int32(i), p: vals[i])
+  var sum = 0.0f
+  for i in 0 ..< n:
+    tmpCpu[i, 0] = exp(tmpCpu[i, 0] - maxL)
+    sum += tmpCpu[i, 0]
 
-  # If we don't need topK or topP, just sample multinomial directly to save time
-  if (topK <= 0 or topK >= nVocab) and topP >= 1.0:
-    let r = rand(1.0'f32)
-    var cur = 0.0'f32
-    for i in 0 ..< nVocab:
-      cur += vals[i]
-      if r <= cur: return int32(i)
-    return int32(nVocab - 1)
+  for i in 0 ..< n:
+    tmpCpu[i, 0] /= sum
 
-  # Apply Top-K
-  if topK > 0 and topK < nVocab:
-    probs.sort(proc (a, b: TokenProb): int = cmp(b.p, a.p))
-    for i in topK ..< nVocab: probs[i].p = 0.0
-    var newSum = 0.0'f32
-    for i in 0 ..< topK: newSum += probs[i].p
-    if newSum > 0:
-      for i in 0 ..< topK: probs[i].p /= newSum
+  # Top-K
+  var pairs = newSeq[(float32, int)](n)
+  for i in 0 ..< n:
+    pairs[i] = (tmpCpu[i, 0], i)
 
-  # Apply Top-P
-  if topP < 1.0:
-    if topK <= 0 or topK >= nVocab:
-      probs.sort(proc (a, b: TokenProb): int = cmp(b.p, a.p))
-    var cumulativeP = 0.0'f32
-    var lastIdx = nVocab - 1
-    for i in 0 ..< nVocab:
-      cumulativeP += probs[i].p
-      if cumulativeP >= topP:
-        lastIdx = i
+  if s.topK > 0 and s.topK < n:
+    pairs.sort(proc(a, b: (float32, int)): int = cmp(b[0], a[0]))
+    for i in s.topK ..< pairs.len:
+      pairs[i][0] = 0.0f
+
+  # Top-P
+  if s.topP > 0 and s.topP < 1.0f:
+    pairs.sort(proc(a, b: (float32, int)): int = cmp(b[0], a[0]))
+    var cumsum = 0.0f
+    var last = pairs.len - 1
+    for i in 0 ..< pairs.len:
+      cumsum += pairs[i][0]
+      if cumsum > s.topP:
+        last = i
         break
-    var newSum = 0.0'f32
-    for i in 0 .. lastIdx: newSum += probs[i].p
-    let r = rand(newSum)
-    var cur = 0.0'f32
-    for i in 0 .. lastIdx:
-      cur += probs[i].p
-      if r <= cur: return probs[i].id
-    return probs[0].id
+    for i in last + 1 ..< pairs.len:
+      pairs[i][0] = 0.0f
 
-  # Final fallback multinomial
-  let r = rand(1.0'f32)
-  var cur = 0.0'f32
-  for i in 0 ..< probs.len:
-    cur += probs[i].p
-    if r <= cur: return probs[i].id
-  return probs[^1].id
+  # Rescale
+  sum = 0.0f
+  for i in 0 ..< pairs.len: sum += pairs[i][0]
+  if sum == 0: return pairs[0][1]
+  for i in 0 ..< pairs.len: pairs[i][0] /= sum
+
+  # Random sample
+  let r = rand(1.0f)
+  var acc = 0.0f
+  for i in 0 ..< pairs.len:
+    acc += pairs[i][0]
+    if r <= acc: return pairs[i][1]
+  return pairs[0][1]
 
 proc main() =
-  randomize()
   if paramCount() < 1:
-    echo "usage: tinylama <model.gguf> [prompt] [options]"
-    echo "options:"
-    echo "  --max-new N      Max new tokens (default: 16)"
-    echo "  --temp T         Temperature (default: 0.0, greedy)"
-    echo "  --top-p P        Top-P sampling (default: 1.0)"
-    echo "  --top-k K        Top-K sampling (default: 50)"
-    echo "  --progress       Show generation progress"
-    quit(1)
-
-  let modelPath = paramStr(1)
-  var prompt = ""
-  var startIdx = 2
-  if paramCount() >= 2 and not paramStr(2).startsWith("--"):
-    prompt = paramStr(2)
-    startIdx = 3
-
-  var maxNew = 16
-  var temp: float32 = 0.0
-  var topP: float32 = 1.0
-  var topK = 50
-  var showProgress = false
-  var i = startIdx
-  while i <= paramCount():
-    let arg = paramStr(i)
-    if arg == "--progress":
-      showProgress = true
-    elif arg == "--max-new" and i + 1 <= paramCount():
-      maxNew = parseInt(paramStr(i + 1))
-      inc i
-    elif arg == "--temp" and i + 1 <= paramCount():
-      temp = parseFloat(paramStr(i + 1)).float32
-      inc i
-    elif arg == "--top-p" and i + 1 <= paramCount():
-      topP = parseFloat(paramStr(i + 1)).float32
-      inc i
-    elif arg == "--top-k" and i + 1 <= paramCount():
-      topK = parseInt(paramStr(i + 1))
-      inc i
-    else:
-      echo "unknown arg: ", arg
-      quit(1)
-    inc i
-
-  var gg = openGguf(modelPath)
-  let vocab = loadVocab(gg)
-  gg.close()
-
-  var m = loadModel(modelPath)
-  defer: m.close()
-  let nVocab = m.hparams.nVocab
-
-  var allTokens: seq[int32] = @[]
-  var cache = initKvCache(m.hparams, max(32, maxNew + 32))
-
-  proc runPrompt(line: string) =
-    let fullPrompt = formatChatPrompt(vocab, line)
-    let useSpecial = fullPrompt != line
-    let tokens = tokenizeWithSpecial(vocab, fullPrompt, addSpecial = not useSpecial)
-    allTokens.add(tokens)
-
-    if cache.curLen == 0:
-      if showProgress: stderr.write("prefill... ")
-      let logits0 = forwardPrefill(m, allTokens, cache)
-      if showProgress: stderr.writeLine("done")
-      var next = sample(logits0, nVocab, temp, topP, topK)
-      allTokens.add(next)
-      stdout.write(detokenize(vocab, @[next]))
-      stdout.flushFile()
-      for j in 1 ..< maxNew:
-        if showProgress: stderr.write("decode ", $j, "/", $maxNew, "... ")
-        let logits = forwardDecode(m, next, cache)
-        next = sample(logits, nVocab, temp, topP, topK)
-        allTokens.add(next)
-        stdout.write(detokenize(vocab, @[next]))
-        stdout.flushFile()
-        if showProgress: stderr.writeLine("tok=" & $next)
-      stdout.write("\n")
-    else:
-      var lastLogits: GGTensor
-      for t in tokens:
-        lastLogits = forwardDecode(m, t, cache)
-      var next = sample(lastLogits, nVocab, temp, topP, topK)
-      allTokens.add(next)
-      stdout.write(detokenize(vocab, @[next]))
-      stdout.flushFile()
-      for j in 1 ..< maxNew:
-        if showProgress: stderr.write("decode ", $j, "/", $maxNew, "... ")
-        let logits = forwardDecode(m, next, cache)
-        next = sample(logits, nVocab, temp, topP, topK)
-        allTokens.add(next)
-        stdout.write(detokenize(vocab, @[next]))
-        stdout.flushFile()
-        if showProgress: stderr.writeLine("tok=" & $next)
-      stdout.write("\n")
-
-  if prompt.len > 0:
-    runPrompt(prompt)
+    echo "Usage: tinylama <model.gguf> [prompt] [max-new-tokens]"
     return
 
-  echo "REPL ready. Enter text, empty line or :quit to exit."
-  while true:
-    stdout.write("> ")
-    stdout.flushFile()
-    var line = ""
-    if not stdin.readLine(line):
-      break
-    line = line.strip()
-    if line.len == 0 or line == ":quit" or line == ":q":
-      break
-    runPrompt(line)
+  let modelPath = paramStr(1)
+  let prompt = if paramCount() >= 2: paramStr(2) else: "Once upon a time"
+  let maxNew = if paramCount() >= 3: parseInt(paramStr(3)) else: 128
 
-when isMainModule:
-  main()
+  randomize()
+
+  echo "Loading model: ", modelPath
+  var m = loadModel(modelPath)
+  echo "Architecture: ", m.hparams.arch
+  echo "Params: ", m.hparams
+
+  echo "Loading tokenizer..."
+  let vocab = loadVocab(m.gguf)
+
+  echo "Tokenizing..."
+  let tokens = tokenize(vocab, prompt)
+  echo "Prompt tokens: ", tokens
+
+  var cache = initKvCache(m, 2048)
+  let sampler = Sampler(temp: 0.8f, topK: 40, topP: 0.9f)
+
+  echo "Prefill..."
+  let startPrefill = cpuTime()
+  var logits = forwardPrefill(m, cache, tokens)
+  echo "Prefill done in ", (cpuTime() - startPrefill).formatFloat(ffDecimal, 2), "s"
+
+  var next = int32(sample(logits, sampler))
+  stdout.write(detokenize(vocab, @[next]))
+  stdout.flushFile()
+
+  for i in 1 ..< maxNew:
+    if next == vocab.eosId: break
+    logits = forwardNext(m, cache, next)
+    next = int32(sample(logits, sampler))
+    stdout.write(detokenize(vocab, @[next]))
+    stdout.flushFile()
+  echo ""
+
+main()

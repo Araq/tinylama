@@ -9,18 +9,18 @@ import ./tensor
 import ./quant
 
 const
-  GGML_TYPE_F32 = 0
-  GGML_TYPE_F16 = 1
-  GGML_TYPE_Q4_0 = 2
-  GGML_TYPE_Q4_1 = 3
-  GGML_TYPE_Q5_0 = 6
-  GGML_TYPE_Q5_1 = 7
-  GGML_TYPE_Q8_0 = 8
-  GGML_TYPE_Q2_K = 10
-  GGML_TYPE_Q3_K = 11
-  GGML_TYPE_Q4_K = 12
-  GGML_TYPE_Q5_K = 13
-  GGML_TYPE_Q6_K = 14
+  GGML_TYPE_F32* = 0
+  GGML_TYPE_F16* = 1
+  GGML_TYPE_Q4_0* = 2
+  GGML_TYPE_Q4_1* = 3
+  GGML_TYPE_Q5_0* = 6
+  GGML_TYPE_Q5_1* = 7
+  GGML_TYPE_Q8_0* = 8
+  GGML_TYPE_Q2_K* = 10
+  GGML_TYPE_Q3_K* = 11
+  GGML_TYPE_Q4_K* = 12
+  GGML_TYPE_Q5_K* = 13
+  GGML_TYPE_Q6_K* = 14
 
 type
   HParams* = object
@@ -32,6 +32,7 @@ type
     nFfn*: int
     nHead*: int
     nHeadKv*: int
+    headDim*: int
     ropeDim*: int
     ropeFreqBase*: float32
     ropeFreqScale*: float32
@@ -122,6 +123,7 @@ proc loadHParams(g: GgufFile): HParams =
   if g.getKvU32(p & "feed_forward_length", v) or g.getKvU32("llama.feed_forward_length", v): result.nFfn = int(v)
   if g.getKvU32(p & "attention.head_count", v) or g.getKvU32("llama.attention.head_count", v): result.nHead = int(v)
   if g.getKvU32(p & "attention.head_count_kv", v) or g.getKvU32("llama.attention.head_count_kv", v): result.nHeadKv = int(v)
+  if g.getKvU32(p & "attention.head_dim", v) or g.getKvU32("llama.attention.head_dim", v): result.headDim = int(v)
   if g.getKvU32(p & "rope.dimension_count", v) or g.getKvU32("llama.rope.dimension_count", v): result.ropeDim = int(v)
   var f: float32
   if g.getKvF32(p & "rope.freq_base", f) or g.getKvF32("llama.rope.freq_base", f): result.ropeFreqBase = f
@@ -130,13 +132,14 @@ proc loadHParams(g: GgufFile): HParams =
 
   if result.ropeFreqBase == 0: result.ropeFreqBase = 10000.0
   if result.nHeadKv == 0: result.nHeadKv = result.nHead
+  if result.headDim == 0 and result.nHead > 0: result.headDim = result.nEmb div result.nHead
 
   # Architecture specific defaults and overrides
   result.actType = "silu"
   result.normType = "rms"
   result.ropeType = "llama"
 
-  if result.arch == "gemma":
+  if result.arch == "gemma" or result.arch == "gemma2":
     result.actType = "gelu"
     result.normType = "rms"
   elif result.arch == "phi3":
