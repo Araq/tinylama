@@ -47,14 +47,45 @@ proc initKvCache*(hp: HParams, maxLen: int): KvCache =
     result.v[i] = newGGTensor(@[kvDim, maxLen])
 
 proc applyRopeSingle(x: var GGTensor, nHead, headDim, ropeDim: int, base: float32) =
-  ropeInplace(x, base)
+  let xShape = x.shape
+  let seqLen = xShape[1]
+  var cpuX = x.at.toCpu()
+  for h in 0 ..< nHead:
+    for p in 0 ..< seqLen:
+      for i in 0 ..< ropeDim div 2:
+        let theta = pow(1.0'f32 / base, float32(2 * i) / float32(ropeDim))
+        let angle = float32(p) * theta
+        let c = cos(angle)
+        let s = sin(angle)
+        let idx0 = h * headDim + 2 * i
+        let idx1 = h * headDim + 2 * i + 1
+        let v0 = cpuX[idx0, p]
+        let v1 = cpuX[idx1, p]
+        cpuX[idx0, p] = v0 * c - v1 * s
+        cpuX[idx1, p] = v0 * s + v1 * c
+  x.at = cpuX.toDevice()
 
 proc applyRopeAtPos(x: var GGTensor, nHead, headDim, ropeDim: int, base: float32, pos: int) =
-  ropeInplace(x, base, pos)
+  var cpuX = x.at.toCpu()
+  let fpos = float32(pos)
+  for h in 0 ..< nHead:
+    for i in 0 ..< ropeDim div 2:
+      let theta = pow(1.0'f32 / base, float32(2 * i) / float32(ropeDim))
+      let angle = fpos * theta
+      let c = cos(angle)
+      let s = sin(angle)
+      let idx0 = h * headDim + 2 * i
+      let idx1 = h * headDim + 2 * i + 1
+      let v0 = cpuX[idx0, 0]
+      let v1 = cpuX[idx1, 0]
+      cpuX[idx0, 0] = v0 * c - v1 * s
+      cpuX[idx1, 0] = v0 * s + v1 * c
+  x.at = cpuX.toDevice()
 
 proc attentionFull(q, k, v, wo: GGTensor, nHead, nHeadKv, headDim: int): GGTensor =
   let seqLen = q.at.shape[1]
   let group = nHead div nHeadKv
+
   let qr = q.at.reshape(nHead, headDim, seqLen)
   let kr = k.at.reshape(nHeadKv, headDim, seqLen)
   let vr = v.at.reshape(nHeadKv, headDim, seqLen)
@@ -66,7 +97,6 @@ proc attentionFull(q, k, v, wo: GGTensor, nHead, nHeadKv, headDim: int): GGTenso
     let kh = kr[kvh, _, _].reshape(headDim, seqLen)
     let vh = vr[kvh, _, _].reshape(headDim, seqLen)
 
-    # We do attention on CPU for now as it's complex to vectorize on GPU without custom kernels
     let qhCpu = qh.toCpu()
     let khCpu = kh.toCpu()
     let vhCpu = vh.toCpu()

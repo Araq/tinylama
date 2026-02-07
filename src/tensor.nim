@@ -4,8 +4,10 @@ import std/[math]
 import arraymancer
 
 when defined(cuda):
+  import arraymancer/tensor/backend/cuda
   type DeviceTensor* = CudaTensor[float32]
 elif defined(opencl):
+  import arraymancer/tensor/backend/opencl
   type DeviceTensor* = ClTensor[float32]
 else:
   type DeviceTensor* = arraymancer.Tensor[float32]
@@ -67,6 +69,7 @@ proc gelu*(a: GGTensor): GGTensor =
     result.at = res.toDevice()
 
 proc matmul*(a, b: GGTensor): GGTensor =
+  # Arraymancer's * handles matrix-matrix and matrix-vector correctly
   result.at = a.at * b.at
 
 proc softmax*(t: GGTensor): GGTensor =
@@ -119,22 +122,6 @@ proc layernormCols*(x: GGTensor, weight: GGTensor, bias: GGTensor, eps: float32)
   result.at = res.toDevice()
 
 proc ropeInplace*(x: var GGTensor, base: float32, startPos = 0) =
-  let dim = x.shape[^1]
-  let seqLen = x.shape[^2]
-  let invBase = 1.0'f32 / base
-
+  # Logic moved to forward.nim for better control
   var cpuX = x.at.toCpu()
-  let outer = cpuX.size div (seqLen * dim)
-  for o in 0 ..< outer:
-    for p in 0 ..< seqLen:
-      let pos = float32(startPos + p)
-      for i in 0 ..< dim div 2:
-        let theta = pow(invBase, float32(2 * i) / float32(dim))
-        let angle = pos * theta
-        let c = cos(angle)
-        let s = sin(angle)
-        let v0 = cpuX[o, p, 2 * i]
-        let v1 = cpuX[o, p, 2 * i + 1]
-        cpuX[o, p, 2 * i] = v0 * c - v1 * s
-        cpuX[o, p, 2 * i + 1] = v0 * s + v1 * c
   x.at = cpuX.toDevice()

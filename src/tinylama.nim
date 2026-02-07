@@ -12,11 +12,12 @@ proc sample(logits: GGTensor, nVocab: int, temperature: float32 = 0.0, topP: flo
   let lshape = logits.shape
   let seqLen = if lshape[0] == nVocab: lshape[1] else: lshape[0]
 
+  let cpuLogits = logits.at.toCpu()
   var vals = newSeq[float32](nVocab)
   if lshape[0] == nVocab:
-    for i in 0 ..< nVocab: vals[i] = logits.at[i, seqLen - 1]
+    for i in 0 ..< nVocab: vals[i] = cpuLogits[i, seqLen - 1]
   else:
-    for i in 0 ..< nVocab: vals[i] = logits.at[seqLen - 1, i]
+    for i in 0 ..< nVocab: vals[i] = cpuLogits[seqLen - 1, i]
 
   if temperature <= 0.0:
     var bestIdx = 0
@@ -52,8 +53,6 @@ proc sample(logits: GGTensor, nVocab: int, temperature: float32 = 0.0, topP: flo
 
   # Apply Top-K
   if topK > 0 and topK < nVocab:
-    # Partial sort to get topK elements would be better, but Nim doesn't have it in stdlib.
-    # We sort the whole thing for now, but only if topK is reasonably small or if Top-P is also used.
     probs.sort(proc (a, b: TokenProb): int = cmp(b.p, a.p))
     for i in topK ..< nVocab: probs[i].p = 0.0
     var newSum = 0.0'f32

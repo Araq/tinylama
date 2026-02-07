@@ -1,4 +1,4 @@
-## Minimal model loader that reads GGUF tensors into float32.
+## Minimal model loader that reads GGUF tensors into Arraymancer tensors.
 
 import std/[tables]
 when cpuEndian != littleEndian:
@@ -52,9 +52,15 @@ proc tensorElemCount(info: GgufTensorInfo): int =
   int(n)
 
 proc tensorShape(info: GgufTensorInfo): seq[int] =
-  result = newSeq[int](int(info.nDims))
-  for i in 0 ..< int(info.nDims):
-    result[i] = int(info.ne[i])
+  # Reverse dimensions for Arraymancer (contiguous dim last in GGUF, first in Arraymancer rows)
+  # Actually GGUF dim0 is most contiguous. Arraymancer last dim is most contiguous.
+  # So we should reverse.
+  result = @[]
+  if info.nDims == 0:
+    result = @[1]
+  else:
+    for i in countdown(int(info.nDims) - 1, 0):
+      result.add(int(info.ne[i]))
 
 proc loadTensorF32(g: GgufFile, info: GgufTensorInfo): GGTensor =
   let count = tensorElemCount(info)
@@ -118,9 +124,7 @@ proc loadTensorF32(g: GgufFile, info: GgufTensorInfo): GGTensor =
   else:
     raise newException(ValueError, "unsupported ggml type: " & $info.elemType)
 
-  when defined(cuda): result.at = cpuAt.cuda()
-  elif defined(opencl): result.at = cpuAt.opencl()
-  else: result.at = cpuAt
+  result.at = cpuAt.toDevice()
 
 proc loadHParams(g: GgufFile): HParams =
   discard g.getKvStr("general.architecture", result.arch)
