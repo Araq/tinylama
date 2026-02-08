@@ -1,160 +1,162 @@
-## Minimal float32 tensor utilities (CPU, contiguous).
+## Minimal float32 tensor utilities using Arraymancer.
 
 import std/[math]
+import arraymancer
+
+when defined(cuda):
+  type DeviceTensor* = CudaTensor[float32]
+elif defined(opencl):
+  type DeviceTensor* = ClTensor[float32]
+else:
+  type DeviceTensor* = arraymancer.Tensor[float32]
 
 type
-  Tensor* = object
-    data*: seq[float32]
-    shape*: seq[int]
-    strides*: seq[int]
+  GGTensor* = object
+    at*: DeviceTensor
 
-proc computeStrides(shape: seq[int]): seq[int] =
-  result = newSeq[int](shape.len)
-  var stride = 1
-  for i in countdown(shape.len - 1, 0):
-    result[i] = stride
-    stride *= shape[i]
+template toCpu*[T](t: arraymancer.Tensor[T]): arraymancer.Tensor[T] = t
+when defined(cuda):
+  template toCpu*[T](t: CudaTensor[T]): arraymancer.Tensor[T] = t.cpu()
+when defined(opencl):
+  template toCpu*[T](t: ClTensor[T]): arraymancer.Tensor[T] = t.cpu()
 
-proc numel*(shape: seq[int]): int =
-  result = 1
-  for s in shape:
-    result *= s
+template toDevice*[T](t: arraymancer.Tensor[T]): DeviceTensor =
+  when DeviceTensor is arraymancer.Tensor[float32]: t
+  elif defined(cuda): t.cuda()
+  elif defined(opencl): t.opencl()
 
-proc newTensor*(shape: seq[int]): Tensor =
-  result.shape = shape
-  result.strides = computeStrides(shape)
-  result.data = newSeq[float32](numel(shape))
+proc shape*(t: GGTensor): seq[int] =
+  result = @[]
+  for s in t.at.shape: result.add(s)
 
-proc reshape*(t: Tensor, shape: seq[int]): Tensor =
-  if numel(shape) != t.data.len:
-    raise newException(ValueError,
-      "reshape: element count mismatch (" & $t.data.len & " vs " & $numel(shape) & ")")
-  result.data = t.data
-  result.shape = shape
-  result.strides = computeStrides(shape)
+proc toGGTensor*(at: DeviceTensor): GGTensor = GGTensor(at: at)
 
-proc checkSameShape(a, b: Tensor) =
-  if a.shape != b.shape:
-    raise newException(ValueError, "shape mismatch: " & $a.shape & " vs " & $b.shape)
+proc newGGTensor*(shape: seq[int]): GGTensor =
+  let cpu = newTensor[float32](shape)
+  result.at = cpu.toDevice()
 
-proc add*(a, b: Tensor): Tensor =
-  checkSameShape(a, b)
-  result = newTensor(a.shape)
-  for i in 0 ..< a.data.len:
-    result.data[i] = a.data[i] + b.data[i]
+proc reshape*(t: GGTensor, shape: seq[int]): GGTensor =
+  result.at = t.at.reshape(shape)
 
-proc mul*(a, b: Tensor): Tensor =
-  checkSameShape(a, b)
-  result = newTensor(a.shape)
-  for i in 0 ..< a.data.len:
-    result.data[i] = a.data[i] * b.data[i]
+proc transpose*(t: GGTensor): GGTensor =
+  result.at = t.at.transpose()
 
-proc silu*(a: Tensor): Tensor =
-  result = newTensor(a.shape)
-  for i in 0 ..< a.data.len:
-    let x = a.data[i]
-    result.data[i] = x / (1.0'f32 + exp(-x))
+proc add*(a, b: GGTensor): GGTensor =
+  result.at = a.at +. b.at
 
-proc matmul*(a, b: Tensor): Tensor =
-  ## 2D matmul: (m x k) * (k x n) -> (m x n)
-  if a.shape.len != 2 or b.shape.len != 2:
-    raise newException(ValueError, "matmul: expects 2D tensors")
-  let m = a.shape[0]
-  let k = a.shape[1]
-  let kb = b.shape[0]
-  let n = b.shape[1]
-  if k != kb:
-    raise newException(ValueError, "matmul: inner dim mismatch")
-  result = newTensor(@[m, n])
-  for i in 0 ..< m:
-    let arow = i * k
-    let crow = i * n
-    for j in 0 ..< n:
-      var acc = 0.0'f32
-      for p in 0 ..< k:
-        acc += a.data[arow + p] * b.data[p * n + j]
-      result.data[crow + j] = acc
+proc mul*(a, b: GGTensor): GGTensor =
+  result.at = a.at *. b.at
 
-proc rmsnorm*(x: Tensor, weight: Tensor, eps: float32): Tensor =
-  ## Normalize last dimension and apply per-dim weight.
-  if x.shape.len < 1:
-    raise newException(ValueError, "rmsnorm: empty shape")
-  if weight.shape.len != 1 or weight.shape[0] != x.shape[^1]:
-    raise newException(ValueError, "rmsnorm: weight shape mismatch")
+proc `/`*(a: GGTensor, b: float32): GGTensor =
+  result.at = a.at /. b
+
+proc silu*(a: GGTensor): GGTensor =
+  when DeviceTensor is arraymancer.Tensor[float32]:
+    result.at = a.at.map(proc(x: float32): float32 = x / (1.0'f32 + exp(-x)))
+  else:
+    let cpu = a.at.toCpu()
+    let res = cpu.map(proc(x: float32): float32 = x / (1.0'f32 + exp(-x)))
+    result.at = res.toDevice()
+
+proc gelu*(a: GGTensor): GGTensor =
+  when DeviceTensor is arraymancer.Tensor[float32]:
+    result.at = a.at.map(proc(x: float32): float32 = 0.5'f32 * x * (1.0'f32 + erf(x / sqrt(2.0'f32))))
+  else:
+    let cpu = a.at.toCpu()
+    let res = cpu.map(proc(x: float32): float32 = 0.5'f32 * x * (1.0'f32 + erf(x / sqrt(2.0'f32))))
+    result.at = res.toDevice()
+
+proc matmul*(a, b: GGTensor): GGTensor =
+  # Robust matmul that handles transposed weights often found in GGUF
+  let sA = a.at.shape
+  let sB = b.at.shape
+  if sA[^1] == sB[0]:
+    result.at = a.at * b.at
+  elif sA[0] == sB[0]:
+    result.at = a.at.transpose() * b.at
+  elif sA[^1] == sB[^1]:
+    result.at = a.at * b.at.transpose()
+  else:
+    # Fallback to standard multiplication, which will likely throw a descriptive error if shapes are wrong
+    result.at = a.at * b.at
+
+proc softmax*(t: GGTensor): GGTensor =
+  when DeviceTensor is arraymancer.Tensor[float32]:
+    result.at = t.at.softmax()
+  else:
+    let cpu = t.at.toCpu()
+    result.at = cpu.softmax().toDevice()
+
+proc rmsnorm*(x: GGTensor, weight: GGTensor, eps: float32, isGemma = false): GGTensor =
   let dim = x.shape[^1]
-  let outer = x.data.len div dim
-  result = newTensor(x.shape)
-  for o in 0 ..< outer:
-    var ss = 0.0'f32
-    let base = o * dim
-    for i in 0 ..< dim:
-      let v = x.data[base + i]
-      ss += v * v
+  let cpuX = x.at.toCpu()
+  let cpuW = weight.at.toCpu()
+  var res = newTensor[float32](cpuX.shape)
+  for i in 0 ..< cpuX.shape[0]:
+    let row = cpuX[i, _].reshape(dim)
+    let ss = (row *. row).sum()
     let inv = 1.0'f32 / sqrt(ss / float32(dim) + eps)
-    for i in 0 ..< dim:
-      result.data[base + i] = x.data[base + i] * inv * weight.data[i]
+    if isGemma:
+      res[i, _] = (row *. (inv *. (cpuW +. 1.0f))).reshape(1, dim)
+    else:
+      res[i, _] = (row *. (inv *. cpuW)).reshape(1, dim)
+  result.at = res.toDevice()
 
-proc rmsnormCols*(x: Tensor, weight: Tensor, eps: float32): Tensor =
-  ## Normalize over rows for each column (ggml column layout).
-  if x.shape.len != 2:
-    raise newException(ValueError, "rmsnormCols: expects 2D tensor")
-  if weight.shape.len != 1 or weight.shape[0] != x.shape[0]:
-    raise newException(ValueError, "rmsnormCols: weight shape mismatch")
+proc rmsnormCols*(x: GGTensor, weight: GGTensor, eps: float32, isGemma = false): GGTensor =
   let dim = x.shape[0]
   let seqLen = x.shape[1]
-  result = newTensor(x.shape)
+  let cpuX = x.at.toCpu()
+  let cpuW = weight.at.toCpu()
+  var res = newTensor[float32](cpuX.shape)
   for s in 0 ..< seqLen:
-    var ss = 0.0'f32
-    for r in 0 ..< dim:
-      let v = x.data[r * seqLen + s]
-      ss += v * v
+    let col = cpuX[_, s].reshape(dim)
+    let ss = (col *. col).sum()
     let inv = 1.0'f32 / sqrt(ss / float32(dim) + eps)
-    for r in 0 ..< dim:
-      result.data[r * seqLen + s] = x.data[r * seqLen + s] * inv * weight.data[r]
+    if isGemma:
+      res[_, s] = (col *. (inv *. (cpuW +. 1.0f))).reshape(dim, 1)
+    else:
+      res[_, s] = (col *. (inv *. cpuW)).reshape(dim, 1)
+  result.at = res.toDevice()
 
-proc softmaxLastDim*(x: Tensor): Tensor =
-  if x.shape.len < 1:
-    raise newException(ValueError, "softmax: empty shape")
-  let dim = x.shape[^1]
-  let outer = x.data.len div dim
-  result = newTensor(x.shape)
-  for o in 0 ..< outer:
-    let base = o * dim
-    var maxv = x.data[base]
-    for i in 1 ..< dim:
-      maxv = max(maxv, x.data[base + i])
-    var sum = 0.0'f32
-    for i in 0 ..< dim:
-      let v = exp(x.data[base + i] - maxv)
-      result.data[base + i] = v
-      sum += v
-    let inv = 1.0'f32 / sum
-    for i in 0 ..< dim:
-      result.data[base + i] *= inv
+proc layernormCols*(x: GGTensor, weight: GGTensor, bias: GGTensor, eps: float32): GGTensor =
+  let dim = x.shape[0]
+  let seqLen = x.shape[1]
+  let cpuX = x.at.toCpu()
+  let cpuW = weight.at.toCpu()
+  let cpuB = bias.at.toCpu()
+  var res = newTensor[float32](cpuX.shape)
+  for s in 0 ..< seqLen:
+    let col = cpuX[_, s].reshape(dim)
+    let mean = col.mean()
+    let diff = col -. mean
+    let variance = (diff *. diff).mean()
+    let inv = 1.0'f32 / sqrt(variance + eps)
+    res[_, s] = ((diff *. inv) *. cpuW +. cpuB).reshape(dim, 1)
+  result.at = res.toDevice()
 
-proc ropeInplace*(x: var Tensor, base: float32, startPos = 0) =
-  ## Applies RoPE in-place on the last dimension (must be even).
-  if x.shape.len < 2:
-    raise newException(ValueError, "rope: expected at least 2D tensor")
-  let dim = x.shape[^1]
-  if (dim mod 2) != 0:
-    raise newException(ValueError, "rope: last dim must be even")
-  let seqLen = x.shape[^2]
-  let outer = x.data.len div (seqLen * dim)
-  let invBase = 1.0'f32 / base
-  for o in 0 ..< outer:
-    let outerBase = o * seqLen * dim
-    for p in 0 ..< seqLen:
-      let pos = float32(startPos + p)
-      let row = outerBase + p * dim
-      for i in 0 ..< dim div 2:
-        let idx0 = row + 2 * i
-        let idx1 = row + 2 * i + 1
-        let theta = pow(invBase, float32(2 * i) / float32(dim))
-        let angle = pos * theta
-        let c = cos(angle)
-        let s = sin(angle)
-        let v0 = x.data[idx0]
-        let v1 = x.data[idx1]
-        x.data[idx0] = v0 * c - v1 * s
-        x.data[idx1] = v0 * s + v1 * c
+proc amMatmul*(a, b: GGTensor): GGTensor =
+  # Robust matmul that handles potential transpositions in weights
+  # a is usually the weight [out, in] or [in, out]
+  # b is usually the hidden state [in, seq]
+  let sA = a.at.shape
+  let sB = b.at.shape
+
+  if sA[^1] == sB[0]:
+    result.at = a.at * b.at
+  elif sA[0] == sB[0]:
+    result.at = a.at.transpose() * b.at
+  elif sA[^1] == sB[^1]:
+    result.at = a.at * b.at.transpose()
+  else:
+    # Fallback, likely to throw shape mismatch error if still incompatible
+    result.at = a.at * b.at
+
+proc embeddingLookup*(weight: GGTensor, ids: seq[int]): GGTensor =
+  let nEmb = weight.at.shape[1]
+  let nVocab = weight.at.shape[0]
+  var res = newTensor[float32](nEmb, ids.len)
+  let cpuW = weight.at.toCpu()
+  for i, id in ids:
+    if id >= 0 and id < nVocab:
+      res[_, i] = cpuW[id, _].reshape(nEmb, 1)
+  result.at = res.toDevice()

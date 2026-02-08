@@ -1,329 +1,229 @@
-## Minimal LLaMA-style forward pass (float32, CPU, no KV cache).
-
-import std/[math]
-import ./tensor
+import arraymancer
+import std/[math, tables]
 import ./model
-when defined(useMalebolgia):
-  import malebolgia
-
-proc getTensorOr(m: var Model, a, b: string): Tensor =
-  try:
-    return m.getTensor(a)
-  except KeyError:
-    return m.getTensor(b)
-
-proc embeddingLookup(weight: Tensor, tokens: seq[int32], nVocab, nEmb: int): Tensor =
-  ## Returns [nEmb, seq] in ggml-style column layout.
-  result = newTensor(@[nEmb, tokens.len])
-  if weight.shape.len != 2:
-    raise newException(ValueError, "embedding weight must be 2D")
-  let a0 = weight.shape[0]
-  let a1 = weight.shape[1]
-  if a0 == nVocab and a1 == nEmb:
-    let rowSize = a1
-    for i, t in tokens:
-      let tid = int(t)
-      let row = tid * rowSize
-      for e in 0 ..< nEmb:
-        result.data[e * tokens.len + i] = weight.data[row + e]
-  elif a0 == nEmb and a1 == nVocab:
-    # ggml layout: rows = a1 (vocab), cols = a0 (emb)
-    let rowSize = a0
-    for i, t in tokens:
-      let tid = int(t)
-      let row = tid * rowSize
-      for e in 0 ..< nEmb:
-        result.data[e * tokens.len + i] = weight.data[row + e]
-  else:
-    raise newException(ValueError, "embedding shape mismatch")
-
-proc linearGGMLCol(x: Tensor, w: Tensor): Tensor =
-  ## x: [in, seq], w stored as [in, out] but laid out row-major as rows=out, cols=in.
-  if x.shape.len != 2 or w.shape.len != 2:
-    raise newException(ValueError, "linear: expects 2D tensors")
-  let inDim = x.shape[0]
-  let seqLen = x.shape[1]
-  let wCols = w.shape[0]   # in
-  let wRows = w.shape[1]   # out
-  if wCols != inDim:
-    raise newException(ValueError, "linear: input dim mismatch")
-  result = newTensor(@[wRows, seqLen])
-  when defined(useMalebolgia):
-    proc linearChunk(startRow, endRow: int,
-                     wData, xData, outData: ptr UncheckedArray[float32],
-                     wCols, seqLen: int) {.gcsafe.} =
-      for o in startRow ..< endRow:
-        let wRow = o * wCols
-        let outRow = o * seqLen
-        for s in 0 ..< seqLen:
-          var acc = 0.0'f32
-          for k in 0 ..< wCols:
-            acc += wData[wRow + k] * xData[k * seqLen + s]
-          outData[outRow + s] = acc
-
-    let wData = cast[ptr UncheckedArray[float32]](addr w.data[0])
-    let xData = cast[ptr UncheckedArray[float32]](addr x.data[0])
-    let outData = cast[ptr UncheckedArray[float32]](addr result.data[0])
-    let chunk = if wRows >= 64: 32 else: wRows
-    var m = createMaster()
-    m.awaitAll:
-      var start = 0
-      while start < wRows:
-        let stop = min(start + chunk, wRows)
-        m.spawn linearChunk(start, stop, wData, xData, outData, wCols, seqLen)
-        start = stop
-  else:
-    for o in 0 ..< wRows:
-      let wRow = o * wCols
-      let outRow = o * seqLen
-      for s in 0 ..< seqLen:
-        var acc = 0.0'f32
-        for k in 0 ..< inDim:
-          acc += w.data[wRow + k] * x.data[k * seqLen + s]
-        result.data[outRow + s] = acc
+import ./tensor
 
 type
   KvCache* = object
-    k*: seq[Tensor]
-    v*: seq[Tensor]
-    curLen*: int
+    k*, v*: seq[GGTensor]
     maxLen*: int
+    curLen*: int
     nHeadKv*: int
     headDim*: int
 
-proc initKvCache*(hp: HParams, maxLen: int): KvCache =
-  if hp.nHead <= 0:
-    raise newException(ValueError, "KV cache requires llama-style head_count")
+proc initKvCache*(m: var Model, maxLen: int): KvCache =
+  let hp = m.hparams
   result.maxLen = maxLen
   result.curLen = 0
-  result.nHeadKv = hp.nHeadKv
-  result.headDim = hp.nEmb div hp.nHead
-  let kvDim = hp.nHeadKv * result.headDim
-  result.k = newSeq[Tensor](hp.nLayer)
-  result.v = newSeq[Tensor](hp.nLayer)
+  result.headDim = hp.headDim
+
+  var kvDim = hp.nHeadKv * hp.headDim
+  # Try to find actual kvDim from tensors
+  let testName = "blk.0.attn_k.weight"
+  if m.infos.hasKey(testName):
+    kvDim = int(m.infos[testName].ne[1])
+
+  result.nHeadKv = if result.headDim > 0: kvDim div result.headDim else: hp.nHeadKv
+
+  result.k = newSeq[GGTensor](hp.nLayer)
+  result.v = newSeq[GGTensor](hp.nLayer)
   for i in 0 ..< hp.nLayer:
-    result.k[i] = newTensor(@[kvDim, maxLen])
-    result.v[i] = newTensor(@[kvDim, maxLen])
+    result.k[i].at = newTensor[float32](kvDim, maxLen).toDevice()
+    result.v[i].at = newTensor[float32](kvDim, maxLen).toDevice()
 
-proc applyRopeSingle(x: var Tensor, nHead, headDim, ropeDim: int, base: float32) =
-  let seqLen = x.shape[1]
-  for h in 0 ..< nHead:
-    let hOffset = h * headDim
-    for p in 0 ..< seqLen:
-      for i in 0 ..< ropeDim div 2:
-        let idx0 = (hOffset + 2 * i) * seqLen + p
-        let idx1 = (hOffset + 2 * i + 1) * seqLen + p
-        let theta = pow(1.0'f32 / base, float32(2 * i) / float32(ropeDim))
-        let angle = float32(p) * theta
-        let c = cos(angle)
-        let s = sin(angle)
-        let v0 = x.data[idx0]
-        let v1 = x.data[idx1]
-        x.data[idx0] = v0 * c - v1 * s
-        x.data[idx1] = v0 * s + v1 * c
 
-proc applyRopeAtPos(x: var Tensor, nHead, headDim, ropeDim: int, base: float32, pos: int) =
-  let seqLen = x.shape[1]
-  for h in 0 ..< nHead:
-    let hOffset = h * headDim
-    for i in 0 ..< ropeDim div 2:
-      let idx0 = (hOffset + 2 * i) * seqLen
-      let idx1 = (hOffset + 2 * i + 1) * seqLen
-      let theta = pow(1.0'f32 / base, float32(2 * i) / float32(ropeDim))
-      let angle = float32(pos) * theta
-      let c = cos(angle)
-      let s = sin(angle)
-      let v0 = x.data[idx0]
-      let v1 = x.data[idx1]
-      x.data[idx0] = v0 * c - v1 * s
-      x.data[idx1] = v0 * s + v1 * c
+proc applyRopeInternal(x: var GGTensor, nHead: int, headDim: int, ropeDim: int, base: float32, posOffset: int, arch: string) =
+  var cpuX = x.at.toCpu()
+  let nTokens = cpuX.shape[1]
+  let rDim = if ropeDim > 0: ropeDim else: headDim
 
-proc attentionFull(q, k, v, wo: Tensor, nHead, nHeadKv, headDim: int): Tensor =
-  let seqLen = q.shape[1]
+  for p in 0 ..< nTokens:
+    let pos = float32(p + posOffset)
+    for i in 0 ..< rDim div 2:
+      let theta = pow(base, -float32(2 * i) / float32(rDim))
+      let cos_val = cos(pos * theta)
+      let sin_val = sin(pos * theta)
+      for h in 0 ..< nHead:
+        if arch == "llama" or arch == "mistral" or arch == "gemma" or arch == "gemma2":
+          # Split half RoPE
+          let idx0 = h * headDim + i
+          let idx1 = h * headDim + i + headDim div 2
+          let v0 = cpuX[idx0, p]
+          let v1 = cpuX[idx1, p]
+          cpuX[idx0, p] = v0 * cos_val - v1 * sin_val
+          cpuX[idx1, p] = v0 * sin_val + v1 * cos_val
+        else:
+          # Interleaved RoPE
+          let idx0 = h * headDim + 2 * i
+          let idx1 = h * headDim + 2 * i + 1
+          let v0 = cpuX[idx0, p]
+          let v1 = cpuX[idx1, p]
+          cpuX[idx0, p] = v0 * cos_val - v1 * sin_val
+          cpuX[idx1, p] = v0 * sin_val + v1 * cos_val
+  x.at = cpuX.toDevice()
 
-  var ctx = newTensor(@[nHead * headDim, seqLen])
-  let group = nHead div nHeadKv
-  for h in 0 ..< nHead:
-    let kvh = h div group
-    let hOff = h * headDim
-    for i in 0 ..< seqLen:
-      var scores = newSeq[float32](i + 1)
-      for j in 0 ..< i + 1:
-        var dot = 0.0'f32
-        for d in 0 ..< headDim:
-          let qIdx = (hOff + d) * seqLen + i
-          let kIdx = (kvh * headDim + d) * seqLen + j
-          dot += q.data[qIdx] * k.data[kIdx]
-        scores[j] = dot / sqrt(float32(headDim))
-      # softmax
-      var maxv = scores[0]
-      for j in 1 ..< scores.len:
-        if scores[j] > maxv: maxv = scores[j]
-      var sum = 0.0'f32
-      for j in 0 ..< scores.len:
-        scores[j] = exp(scores[j] - maxv)
-        sum += scores[j]
-      let inv = 1.0'f32 / sum
-      for j in 0 ..< scores.len:
-        scores[j] *= inv
-      # weighted sum of V
-      for d in 0 ..< headDim:
-        var acc = 0.0'f32
-        for j in 0 ..< scores.len:
-          let vIdx = (kvh * headDim + d) * seqLen + j
-          acc += scores[j] * v.data[vIdx]
-        let outIdx = (hOff + d) * seqLen + i
-        ctx.data[outIdx] = acc
-  linearGGMLCol(ctx, wo)
 
-proc attentionCached(q: Tensor, kCache, vCache: Tensor, curLen, nHead, nHeadKv, headDim: int): Tensor =
-  ## q is [nHead*headDim, 1]; caches are [kvDim, maxLen]
-  var ctx = newTensor(@[nHead * headDim, 1])
-  let group = nHead div nHeadKv
-  for h in 0 ..< nHead:
-    let kvh = h div group
-    let hOff = h * headDim
-    var scores = newSeq[float32](curLen)
-    for j in 0 ..< curLen:
-      var dot = 0.0'f32
-      for d in 0 ..< headDim:
-        let qIdx = (hOff + d)
-        let kIdx = (kvh * headDim + d) * kCache.shape[1] + j
-        dot += q.data[qIdx] * kCache.data[kIdx]
-      scores[j] = dot / sqrt(float32(headDim))
-    var maxv = scores[0]
-    for j in 1 ..< scores.len:
-      if scores[j] > maxv: maxv = scores[j]
-    var sum = 0.0'f32
-    for j in 0 ..< scores.len:
-      scores[j] = exp(scores[j] - maxv)
-      sum += scores[j]
-    let inv = 1.0'f32 / sum
-    for j in 0 ..< scores.len:
-      scores[j] *= inv
-    for d in 0 ..< headDim:
-      var acc = 0.0'f32
-      for j in 0 ..< scores.len:
-        let vIdx = (kvh * headDim + d) * vCache.shape[1] + j
-        acc += scores[j] * vCache.data[vIdx]
-      let outIdx = (hOff + d)
-      ctx.data[outIdx] = acc
-  ctx
-
-proc ffn(x: Tensor, wGate, wUp, wDown: Tensor): Tensor =
-  let gate = linearGGMLCol(x, wGate)
-  let up = linearGGMLCol(x, wUp)
-  let act = mul(silu(gate), up)
-  linearGGMLCol(act, wDown)
-
-proc linearOut(x: Tensor, w: Tensor, nEmb, nVocab: int): Tensor =
-  if w.shape.len != 2:
-    raise newException(ValueError, "output weight must be 2D")
-  let a0 = w.shape[0]
-  let a1 = w.shape[1]
-  if a0 == nEmb and a1 == nVocab:
-    return linearGGMLCol(x, w)
-  elif a0 == nVocab and a1 == nEmb:
-    # treat as rows = vocab
-    return linearGGMLCol(x, w.reshape(@[a1, a0]))
-  else:
-    raise newException(ValueError, "output weight shape mismatch")
-
-proc storeKVRange(cache: var KvCache, layer: int, startPos: int, k, v: Tensor) =
-  let rows = k.shape[0]
-  let cols = k.shape[1]
-  let cacheCols = cache.k[layer].shape[1]
-  for r in 0 ..< rows:
-    let src = r * cols
-    let dst = r * cacheCols + startPos
-    for c in 0 ..< cols:
-      cache.k[layer].data[dst + c] = k.data[src + c]
-      cache.v[layer].data[dst + c] = v.data[src + c]
-
-proc forwardPrefill*(m: var Model, tokens: seq[int32], cache: var KvCache): Tensor =
+proc forwardPrefill*(m: var Model, cache: var KvCache, tokens: seq[int32]): GGTensor =
   let hp = m.hparams
-  if hp.arch != "" and hp.arch != "llama":
-    raise newException(ValueError, "unsupported architecture: " & hp.arch)
-  if hp.nHeadKv != 0 and (hp.nHead mod hp.nHeadKv) != 0:
-    raise newException(ValueError, "GQA requires head_count divisible by head_count_kv")
-  let headDim = hp.nEmb div hp.nHead
-  let ropeDim = if hp.ropeDim > 0: hp.ropeDim else: headDim
+  var intTokens = newSeq[int](tokens.len)
+  for i in 0 ..< tokens.len: intTokens[i] = int(tokens[i])
+  var x = embeddingLookup(m.getTensor("token_embd.weight"), intTokens)
 
-  let tokEmb = getTensorOr(m, "tok_embeddings.weight", "token_embd.weight")
-  var x = embeddingLookup(tokEmb, tokens, hp.nVocab, hp.nEmb)
-  cache.curLen = tokens.len
+  let headDim = hp.headDim
+  let ropeDim = hp.ropeDim
 
   for layer in 0 ..< hp.nLayer:
-    let attnNorm = m.getTensor("blk." & $layer & ".attn_norm.weight")
-    let ffnNorm = m.getTensor("blk." & $layer & ".ffn_norm.weight")
-    let wq = m.getTensor("blk." & $layer & ".attn_q.weight")
-    let wk = m.getTensor("blk." & $layer & ".attn_k.weight")
-    let wv = m.getTensor("blk." & $layer & ".attn_v.weight")
-    let wo = m.getTensor("blk." & $layer & ".attn_output.weight")
-    let wGate = m.getTensor("blk." & $layer & ".ffn_gate.weight")
-    let wUp = m.getTensor("blk." & $layer & ".ffn_up.weight")
-    let wDown = m.getTensor("blk." & $layer & ".ffn_down.weight")
+    let prefix = "blk." & $layer & "."
+    let norm = m.getTensor(prefix & "attn_norm.weight")
+    let wq = m.getTensor(prefix & "attn_q.weight")
+    let wk = m.getTensor(prefix & "attn_k.weight")
+    let wv = m.getTensor(prefix & "attn_v.weight")
+    let wo = m.getTensor(prefix & "attn_output.weight")
 
-    let xNorm = rmsnormCols(x, attnNorm, hp.rmsEps)
-    var q = linearGGMLCol(xNorm, wq)
-    var k = linearGGMLCol(xNorm, wk)
-    let v = linearGGMLCol(xNorm, wv)
-    applyRopeSingle(q, hp.nHead, headDim, ropeDim, hp.ropeFreqBase)
-    applyRopeSingle(k, hp.nHeadKv, headDim, ropeDim, hp.ropeFreqBase)
-    storeKVRange(cache, layer, 0, k, v)
-    let attnOut = attentionFull(q, k, v, wo, hp.nHead, hp.nHeadKv, headDim)
-    x = add(x, attnOut)
+    let xNorm = rmsnormCols(x, norm, hp.rmsEps, hp.normType == "gemma")
 
-    let xNorm2 = rmsnormCols(x, ffnNorm, hp.rmsEps)
-    let ffnOut = ffn(xNorm2, wGate, wUp, wDown)
-    x = add(x, ffnOut)
+    var q = amMatmul(wq, xNorm)
+    var k = amMatmul(wk, xNorm)
+    var v = amMatmul(wv, xNorm)
 
-  let norm = getTensorOr(m, "norm.weight", "output_norm.weight")
+    applyRopeInternal(q, hp.nHead, headDim, ropeDim, hp.ropeFreqBase, 0, hp.arch)
+    applyRopeInternal(k, hp.nHeadKv, headDim, ropeDim, hp.ropeFreqBase, 0, hp.arch)
+
+    # Store in cache
+    cache.k[layer].at[_, 0 ..< tokens.len] = k.at
+    cache.v[layer].at[_, 0 ..< tokens.len] = v.at
+
+    # Attention (Prefill - Optimized)
+    let nHead = hp.nHead
+    let nHeadKv = hp.nHeadKv
+    let nGroup = nHead div nHeadKv
+    let scale = 1.0f / sqrt(float32(headDim))
+    let N = tokens.len
+
+    let q_ext = q.at.toCpu().reshape(nHead, headDim, N)
+    let k_ext = k.at.toCpu().reshape(nHeadKv, headDim, N)
+    let v_ext = v.at.toCpu().reshape(nHeadKv, headDim, N)
+
+    var attnOut = newTensor[float32](nHead, headDim, N)
+
+    for h in 0 ..< nHead:
+      let hkv = h div nGroup
+      let qh = q_ext[h, _, _].reshape(headDim, N)
+      let kh = k_ext[hkv, _, _].reshape(headDim, N)
+      let vh = v_ext[hkv, _, _].reshape(headDim, N)
+
+      var scores = (qh.transpose() * kh) *. scale
+      for i in 0 ..< N:
+        for j in i + 1 ..< N:
+          scores[i, j] = -1e30f
+
+      var scores_sm = newTensor[float32](N, N)
+      for i in 0 ..< N:
+        let row = scores[i, _].reshape(N)
+        scores_sm[i, _] = row.softmax().reshape(1, N)
+      let oh = vh * scores_sm.transpose()
+      attnOut[h, _, _] = oh.reshape(1, headDim, N)
+
+    let attnOutG = GGTensor(at: attnOut.reshape(nHead * headDim, N).toDevice())
+    x.at = x.at +. amMatmul(wo, attnOutG).at
+
+    # FFN
+    let ffnNorm = m.getTensor(prefix & "ffn_norm.weight")
+    let w1 = m.getTensor(prefix & "ffn_gate.weight")
+    let w2 = m.getTensor(prefix & "ffn_down.weight")
+    let w3 = m.getTensor(prefix & "ffn_up.weight")
+
+    let xNorm2 = rmsnormCols(x, ffnNorm, hp.rmsEps, hp.normType == "gemma")
+    var g = amMatmul(w1, xNorm2)
+    if hp.actType == "gelu":
+      g = gelu(g)
+    else:
+      g = silu(g)
+    let u = amMatmul(w3, xNorm2)
+    let ffnOut = amMatmul(w2, GGTensor(at: (g.at *. u.at)))
+    x.at = x.at +. ffnOut.at
+
+  cache.curLen = tokens.len
+  let normFinal = m.getTensor("output_norm.weight")
   let outW = m.getTensor("output.weight")
-  let xNormFinal = rmsnormCols(x, norm, hp.rmsEps)
-  result = linearOut(xNormFinal, outW, hp.nEmb, hp.nVocab)
+  let xNormFinal = rmsnormCols(x, normFinal, hp.rmsEps, hp.normType == "gemma")
+  let logits = amMatmul(outW, xNormFinal)
 
-proc forwardDecode*(m: var Model, token: int32, cache: var KvCache): Tensor =
+  # Return only last token's logits
+  let lastLogits = logits.at[_, tokens.len - 1].reshape(hp.nVocab, 1)
+  GGTensor(at: lastLogits)
+
+proc forwardNext*(m: var Model, cache: var KvCache, token: int32): GGTensor =
   let hp = m.hparams
-  if hp.arch != "" and hp.arch != "llama":
-    raise newException(ValueError, "unsupported architecture: " & hp.arch)
-  if cache.curLen >= cache.maxLen:
-    raise newException(ValueError, "KV cache full")
-  let headDim = hp.nEmb div hp.nHead
-  let ropeDim = if hp.ropeDim > 0: hp.ropeDim else: headDim
-
-  let tokEmb = getTensorOr(m, "tok_embeddings.weight", "token_embd.weight")
-  var x = embeddingLookup(tokEmb, @[token], hp.nVocab, hp.nEmb)
+  var x = embeddingLookup(m.getTensor("token_embd.weight"), @[int(token)])
   let pos = cache.curLen
 
+  let headDim = hp.headDim
+  let ropeDim = hp.ropeDim
+
   for layer in 0 ..< hp.nLayer:
-    let attnNorm = m.getTensor("blk." & $layer & ".attn_norm.weight")
-    let ffnNorm = m.getTensor("blk." & $layer & ".ffn_norm.weight")
-    let wq = m.getTensor("blk." & $layer & ".attn_q.weight")
-    let wk = m.getTensor("blk." & $layer & ".attn_k.weight")
-    let wv = m.getTensor("blk." & $layer & ".attn_v.weight")
-    let wo = m.getTensor("blk." & $layer & ".attn_output.weight")
-    let wGate = m.getTensor("blk." & $layer & ".ffn_gate.weight")
-    let wUp = m.getTensor("blk." & $layer & ".ffn_up.weight")
-    let wDown = m.getTensor("blk." & $layer & ".ffn_down.weight")
+    let prefix = "blk." & $layer & "."
+    let norm = m.getTensor(prefix & "attn_norm.weight")
+    let wq = m.getTensor(prefix & "attn_q.weight")
+    let wk = m.getTensor(prefix & "attn_k.weight")
+    let wv = m.getTensor(prefix & "attn_v.weight")
+    let wo = m.getTensor(prefix & "attn_output.weight")
 
-    let xNorm = rmsnormCols(x, attnNorm, hp.rmsEps)
-    var q = linearGGMLCol(xNorm, wq)
-    var k = linearGGMLCol(xNorm, wk)
-    let v = linearGGMLCol(xNorm, wv)
-    applyRopeAtPos(q, hp.nHead, headDim, ropeDim, hp.ropeFreqBase, pos)
-    applyRopeAtPos(k, hp.nHeadKv, headDim, ropeDim, hp.ropeFreqBase, pos)
-    storeKVRange(cache, layer, pos, k, v)
-    let attnCtx = attentionCached(q, cache.k[layer], cache.v[layer], pos + 1, hp.nHead, hp.nHeadKv, headDim)
-    let attnOut = linearGGMLCol(attnCtx, wo)
-    x = add(x, attnOut)
+    let xNorm = rmsnormCols(x, norm, hp.rmsEps, hp.normType == "gemma")
+    var q = amMatmul(wq, xNorm)
+    var k = amMatmul(wk, xNorm)
+    var v = amMatmul(wv, xNorm)
 
-    let xNorm2 = rmsnormCols(x, ffnNorm, hp.rmsEps)
-    let ffnOut = ffn(xNorm2, wGate, wUp, wDown)
-    x = add(x, ffnOut)
+    applyRopeInternal(q, hp.nHead, headDim, ropeDim, hp.ropeFreqBase, pos, hp.arch)
+    applyRopeInternal(k, hp.nHeadKv, headDim, ropeDim, hp.ropeFreqBase, pos, hp.arch)
 
-  cache.curLen = pos + 1
-  let norm = getTensorOr(m, "norm.weight", "output_norm.weight")
+    cache.k[layer].at[_, pos .. pos] = k.at
+    cache.v[layer].at[_, pos .. pos] = v.at
+
+
+    # Attention (Next - Optimized)
+    let nHead = hp.nHead
+    let nHeadKv = hp.nHeadKv
+    let nGroup = nHead div nHeadKv
+    let scale = 1.0f / sqrt(float32(headDim))
+
+    let q_ext = q.at.toCpu().reshape(nHead, headDim, 1)
+    let k_ext = cache.k[layer].at[_, 0 .. pos].toCpu().reshape(nHeadKv, headDim, pos + 1)
+    let v_ext = cache.v[layer].at[_, 0 .. pos].toCpu().reshape(nHeadKv, headDim, pos + 1)
+
+    var attnOut = newTensor[float32](nHead, headDim, 1)
+
+    for h in 0 ..< nHead:
+      let hkv = h div nGroup
+      let qh = q_ext[h, _, _].reshape(headDim, 1)
+      let kh = k_ext[hkv, _, _].reshape(headDim, pos + 1)
+      let vh = v_ext[hkv, _, _].reshape(headDim, pos + 1)
+
+      let scores = (qh.transpose() * kh) *. scale
+      let scores_sm = scores.softmax()
+      let oh = vh * scores_sm.transpose()
+      attnOut[h, _, _] = oh.reshape(1, headDim, 1)
+
+    let attnOutG = GGTensor(at: attnOut.toDevice())
+    x.at = x.at +. amMatmul(wo, attnOutG).at
+
+    let ffnNorm = m.getTensor(prefix & "ffn_norm.weight")
+    let w1 = m.getTensor(prefix & "ffn_gate.weight")
+    let w2 = m.getTensor(prefix & "ffn_down.weight")
+    let w3 = m.getTensor(prefix & "ffn_up.weight")
+
+    let xNorm2 = rmsnormCols(x, ffnNorm, hp.rmsEps, hp.normType == "gemma")
+    var g = amMatmul(w1, xNorm2)
+    if hp.actType == "gelu":
+      g = gelu(g)
+    else:
+      g = silu(g)
+    let u = amMatmul(w3, xNorm2)
+    let ffnOut = amMatmul(w2, GGTensor(at: (g.at *. u.at)))
+    x.at = x.at +. ffnOut.at
+
+  cache.curLen += 1
+  let normFinal = m.getTensor("output_norm.weight")
   let outW = m.getTensor("output.weight")
-  let xNormFinal = rmsnormCols(x, norm, hp.rmsEps)
-  result = linearOut(xNormFinal, outW, hp.nEmb, hp.nVocab)
+  let xNormFinal = rmsnormCols(x, normFinal, hp.rmsEps, hp.normType == "gemma")
+  result = amMatmul(outW, xNormFinal)

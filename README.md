@@ -15,12 +15,20 @@ Optional progress output:
 nim c -r src/tinylama.nim models/TinyLlama-1.1B-Chat-v1.0.Q2_K.gguf "hello" --max-new 16 --progress
 ```
 
-Optional Malebolgia parallelization (requires Malebolgia available to Nim):
+Optional GPU acceleration (requires CUDA or OpenCL available to Nim and Arraymancer):
 
 ```bash
-nim c -r -d:useMalebolgia -d:ThreadPoolSize=8 -d:FixedChanSize=16 \
-  --path:/home/araq/projects/malebolgia/src \
-  src/tinylama.nim models/TinyLlama-1.1B-Chat-v1.0.Q2_K.gguf "hello" --max-new 16
+# For CUDA
+nim c -r -d:cuda src/tinylama.nim models/model.gguf "hello"
+
+# For Metal/Vulkan (via OpenCL)
+nim c -r -d:opencl src/tinylama.nim models/model.gguf "hello"
+```
+
+Optional Malebolgia parallelization:
+
+```bash
+nim c -r -d:useMalebolgia src/tinylama.nim models/model.gguf "hello"
 ```
 
 ## Download the tested model
