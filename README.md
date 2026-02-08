@@ -23,14 +23,18 @@ nim c -r -d:useMalebolgia -d:ThreadPoolSize=8 -d:FixedChanSize=16 \
   src/tinylama.nim models/TinyLlama-1.1B-Chat-v1.0.Q2_K.gguf "hello" --max-new 16
 ```
 
-Optional Hippo backend (AMD/NVIDIA via Hippo runtime):
+Optional Hippo backend (CUDA via nvcc):
 
 ```bash
-nim cpp -r -d:useHippo -d:useMalloc --cc:hipcc --path:../hippo/src \
+NVCC_PREPEND_FLAGS="-arch=sm_86" nim cpp -r -d:release --cc:nvcc \
+  -d:useHippo -d:HippoRuntime=CUDA -d:useMalloc --path:../hippo/src \
   src/tinylama.nim models/TinyLlama-1.1B-Chat-v1.0.Q2_K.gguf "hello" --max-new 16
 ```
 
-For NVIDIA via HIP, set `HIP_PLATFORM=nvidia` before running this command.
+This command was validated on AWS `g5.xlarge` (NVIDIA A10G, CUDA 13.1 toolkit).
+The `NVCC_PREPEND_FLAGS="-arch=sm_86"` setting avoids a PTX/runtime mismatch on this GPU.
+Requires `hippo >= 0.9.1` (includes CUDA stream/kernel typing fixes), and the tinylama
+CUDA kernel avoids `+=` lowering to `pluseq` in device code.
 
 ## Download the tested model
 
@@ -74,7 +78,8 @@ nim c -r -d:release -d:useMalebolgia -d:ThreadPoolSize=8 -d:FixedChanSize=16 \
 Optional Hippo benchmark run:
 
 ```bash
-nim cpp -r -d:release -d:useHippo -d:useMalloc --cc:hipcc --path:../hippo/src \
+NVCC_PREPEND_FLAGS="-arch=sm_86" nim cpp -r -d:release --cc:nvcc \
+  -d:useHippo -d:HippoRuntime=CUDA -d:useMalloc --path:../hippo/src \
   bench/bench_tinylama.nim models/TinyLlama-1.1B-Chat-v1.0.Q2_K.gguf
 ```
 
