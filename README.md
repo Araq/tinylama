@@ -74,6 +74,19 @@ nim c -r -d:release bench/bench_tinylama.nim \
   models/TinyLlama-1.1B-Chat-v1.0.Q2_K.gguf
 ```
 
+Decode-focused benchmark options:
+
+```bash
+nim c -r -d:release bench/bench_tinylama.nim \
+  models/TinyLlama-1.1B-Chat-v1.0.Q2_K.gguf \
+  --decode-steps 32 --decode-warmup 2 --decode-runs 8
+```
+
+This prints a decode summary with:
+- best/mean total decode latency
+- best/mean `ms/token`
+- best/mean `tok/s`
+
 Optional Malebolgia parallel run:
 
 ```bash
