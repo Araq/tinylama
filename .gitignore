@@ -1,0 +1,5 @@
+models/
+
+# Local binaries
+src/tinylama
+bench/bench_tinylama

@@ -5,34 +5,8 @@ import ./gguf_loader
 import ./tokenizer
 import ./model
 import ./forward
+import ./infer_core
 import ./tensor
-
-proc argmaxLast(logits: Tensor, nVocab: int): int32 =
-  if logits.shape.len != 2:
-    raise newException(ValueError, "logits must be 2D")
-  if logits.shape[0] == nVocab:
-    let seqLen = logits.shape[1]
-    let col = seqLen - 1
-    var bestIdx = 0
-    var bestVal = logits.data[col]
-    for i in 1 ..< nVocab:
-      let v = logits.data[i * seqLen + col]
-      if v > bestVal:
-        bestVal = v
-        bestIdx = i
-    return int32(bestIdx)
-  if logits.shape[1] == nVocab:
-    let seqLen = logits.shape[0]
-    let base = (seqLen - 1) * nVocab
-    var bestIdx = 0
-    var bestVal = logits.data[base]
-    for i in 1 ..< nVocab:
-      let v = logits.data[base + i]
-      if v > bestVal:
-        bestVal = v
-        bestIdx = i
-    return int32(bestIdx)
-  raise newException(ValueError, "logits shape mismatch for vocab")
 
 proc main() =
   if paramCount() < 1:
@@ -73,9 +47,7 @@ proc main() =
   var cache = initKvCache(m.hparams, max(32, maxNew + 32))
 
   proc runPrompt(line: string) =
-    let fullPrompt = formatChatPrompt(vocab, line)
-    let useSpecial = fullPrompt != line
-    let tokens = tokenizeWithSpecial(vocab, fullPrompt, addSpecial = not useSpecial)
+    let tokens = encodePromptTokens(vocab, line)
     allTokens.add(tokens)
 
     if cache.curLen == 0:

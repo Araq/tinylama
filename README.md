@@ -40,6 +40,28 @@ curl -L -o models/TinyLlama-1.1B-Chat-v1.0.Q2_K.gguf \
 - Only GGUF models with LLaMA architecture and supported quant types
   (Q2_K/Q3_K/Q6_K/F16/F32) are currently supported.
 
+## Benchmarking with Benchy
+
+Install bench dependency:
+
+```bash
+nimble install -y benchy
+```
+
+Run benchmarks in release mode:
+
+```bash
+nim c -r -d:release bench/bench_tinylama.nim \
+  models/TinyLlama-1.1B-Chat-v1.0.Q2_K.gguf
+```
+
+Optional Malebolgia parallel run:
+
+```bash
+nim c -r -d:release -d:useMalebolgia -d:ThreadPoolSize=8 -d:FixedChanSize=16 \
+  bench/bench_tinylama.nim models/TinyLlama-1.1B-Chat-v1.0.Q2_K.gguf
+```
+
 ## Example
 
 ```bash

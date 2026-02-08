@@ -7,3 +7,4 @@ srcDir = "src"
 bin = @["tinylama"]
 
 requires "malebolgia >= 1.0.0"
+requires "benchy >= 0.0.1"
