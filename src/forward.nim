@@ -1,10 +1,24 @@
 ## Minimal LLaMA-style forward pass (float32, CPU, no KV cache).
 
-import std/[math]
-import ./tensor
-import ./model
+import
+  std/[math],
+  ./[model, tensor]
+
+when defined(useHippo) and defined(useMalebolgia):
+  {.error: "useHippo and useMalebolgia are mutually exclusive. Choose one backend.".}
+
 when defined(useMalebolgia):
   import malebolgia
+
+when defined(useHippo):
+  when not defined(cpp):
+    {.error: "useHippo requires Nim's C++ backend. Build with `nim cpp`.".}
+  import hippo
+
+when defined(useHippo):
+  const
+    HippoBlockSizeX = 16
+    HippoBlockSizeY = 16
 
 proc getTensorOr(m: var Model, a, b: string): Tensor =
   try:
@@ -37,8 +51,74 @@ proc embeddingLookup(weight: Tensor, tokens: seq[int32], nVocab, nEmb: int): Ten
   else:
     raise newException(ValueError, "embedding shape mismatch")
 
+when defined(useHippo):
+  proc linearHippoKernel(
+    wData, xData, outData: ptr float32,
+    outRows, wCols, seqLen: cint
+  ) {.hippoGlobal.} =
+    ## Compute one output element for the ggml-column GEMM layout.
+    let outRow = int(blockIdx.y * blockDim.y + threadIdx.y)
+    let seqCol = int(blockIdx.x * blockDim.x + threadIdx.x)
+    if outRow < int(outRows) and seqCol < int(seqLen):
+      let wArray = cast[ptr UncheckedArray[float32]](wData)
+      let xArray = cast[ptr UncheckedArray[float32]](xData)
+      let outArray = cast[ptr UncheckedArray[float32]](outData)
+      var acc = 0.0'f32
+      for k in 0 ..< int(wCols):
+        acc += wArray[outRow * int(wCols) + k] * xArray[k * int(seqLen) + seqCol]
+      outArray[outRow * int(seqLen) + seqCol] = acc
+
+when defined(useHippo):
+  proc linearHippoCol(x: Tensor, w: Tensor, wCols, wRows, seqLen: int): Tensor =
+    ## Run ggml-column GEMM through Hippo on HIP/CUDA backends.
+    result = newTensor(@[wRows, seqLen])
+    if result.data.len == 0:
+      return result
+
+    let wBytes = w.data.len * sizeof(float32)
+    let xBytes = x.data.len * sizeof(float32)
+    let outBytes = result.data.len * sizeof(float32)
+
+    let stream = hippoStreamCreate()
+    defer: hippoStreamDestroy(stream)
+
+    let devW = hippoMalloc(wBytes)
+    let devX = hippoMalloc(xBytes)
+    let devOut = hippoMalloc(outBytes)
+
+    hippoMemcpyAsync(devW.p, unsafeAddr w.data[0], wBytes, HippoMemcpyHostToDevice, stream)
+    hippoMemcpyAsync(devX.p, unsafeAddr x.data[0], xBytes, HippoMemcpyHostToDevice, stream)
+
+    let blockDim = newDim3(HippoBlockSizeX.uint32, HippoBlockSizeY.uint32)
+    let gridX = (seqLen + HippoBlockSizeX - 1) div HippoBlockSizeX
+    let gridY = (wRows + HippoBlockSizeY - 1) div HippoBlockSizeY
+    let gridDim = newDim3(gridX.uint32, gridY.uint32)
+    var devWPtr = devW.p
+    var devXPtr = devX.p
+    var devOutPtr = devOut.p
+    var outRowsArg = wRows.cint
+    var wColsArg = wCols.cint
+    var seqLenArg = seqLen.cint
+
+    hippoLaunchKernel(
+      linearHippoKernel,
+      gridDim = gridDim,
+      blockDim = blockDim,
+      stream = stream,
+      args = hippoArgs(devWPtr, devXPtr, devOutPtr, outRowsArg, wColsArg, seqLenArg)
+    )
+
+    hippoMemcpyAsync(
+      unsafeAddr result.data[0],
+      devOut.p,
+      outBytes,
+      HippoMemcpyDeviceToHost,
+      stream
+    )
+    hippoStreamSynchronize(stream)
+
 proc linearGGMLCol(x: Tensor, w: Tensor): Tensor =
-  ## x: [in, seq], w stored as [in, out] but laid out row-major as rows=out, cols=in.
+  ## Multiply x and w using ggml column layout.
   if x.shape.len != 2 or w.shape.len != 2:
     raise newException(ValueError, "linear: expects 2D tensors")
   let inDim = x.shape[0]
@@ -47,8 +127,10 @@ proc linearGGMLCol(x: Tensor, w: Tensor): Tensor =
   let wRows = w.shape[1]   # out
   if wCols != inDim:
     raise newException(ValueError, "linear: input dim mismatch")
-  result = newTensor(@[wRows, seqLen])
-  when defined(useMalebolgia):
+  when defined(useHippo):
+    return linearHippoCol(x, w, wCols, wRows, seqLen)
+  elif defined(useMalebolgia):
+    result = newTensor(@[wRows, seqLen])
     proc linearChunk(startRow, endRow: int,
                      wData, xData, outData: ptr UncheckedArray[float32],
                      wCols, seqLen: int) {.gcsafe.} =
@@ -73,6 +155,7 @@ proc linearGGMLCol(x: Tensor, w: Tensor): Tensor =
         m.spawn linearChunk(start, stop, wData, xData, outData, wCols, seqLen)
         start = stop
   else:
+    result = newTensor(@[wRows, seqLen])
     for o in 0 ..< wRows:
       let wRow = o * wCols
       let outRow = o * seqLen

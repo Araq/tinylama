@@ -23,6 +23,20 @@ nim c -r -d:useMalebolgia -d:ThreadPoolSize=8 -d:FixedChanSize=16 \
   src/tinylama.nim models/TinyLlama-1.1B-Chat-v1.0.Q2_K.gguf "hello" --max-new 16
 ```
 
+Optional Hippo backend (AMD/NVIDIA via Hippo runtime):
+
+```bash
+nim cpp -r -d:useHippo --path:../hippo/src \
+  src/tinylama.nim models/TinyLlama-1.1B-Chat-v1.0.Q2_K.gguf "hello" --max-new 16
+```
+
+If you are missing HIP/CUDA toolchain programs, use Hippo's flake shell first:
+
+```bash
+nix develop ../hippo#all -c nim cpp -r -d:useHippo --path:../hippo/src \
+  src/tinylama.nim models/TinyLlama-1.1B-Chat-v1.0.Q2_K.gguf "hello" --max-new 16
+```
+
 ## Download the tested model
 
 This project was tested with the TinyLlama 1.1B Q2_K GGUF.
@@ -35,7 +49,7 @@ curl -L -o models/TinyLlama-1.1B-Chat-v1.0.Q2_K.gguf \
 
 ## Notes
 
-- The current forward pass is CPU-only and naive (no batching, no optimizations).
+- The default forward pass is CPU and naive (no batching, no optimizations).
 - KV cache is enabled for decode steps to improve speed.
 - Only GGUF models with LLaMA architecture and supported quant types
   (Q2_K/Q3_K/Q6_K/F16/F32) are currently supported.
@@ -59,6 +73,13 @@ Optional Malebolgia parallel run:
 
 ```bash
 nim c -r -d:release -d:useMalebolgia -d:ThreadPoolSize=8 -d:FixedChanSize=16 \
+  bench/bench_tinylama.nim models/TinyLlama-1.1B-Chat-v1.0.Q2_K.gguf
+```
+
+Optional Hippo benchmark run:
+
+```bash
+nim cpp -r -d:release -d:useHippo --path:../hippo/src \
   bench/bench_tinylama.nim models/TinyLlama-1.1B-Chat-v1.0.Q2_K.gguf
 ```
 
