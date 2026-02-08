@@ -132,7 +132,7 @@ proc forwardPrefill*(m: var Model, cache: var KvCache, tokens: seq[int32]): GGTe
             attnOut[h * headDim + d, t] += scores[i, 0] * cpuV[hkv * headDim + d, i]
 
     let attnOutG = GGTensor(at: attnOut.toDevice())
-    x.at = x.at + amMatmul(wo, attnOutG).at
+    x.at = x.at +. amMatmul(wo, attnOutG).at
 
     # FFN
     let ffnNorm = m.getTensor(prefix & "ffn_norm.weight")
@@ -147,8 +147,8 @@ proc forwardPrefill*(m: var Model, cache: var KvCache, tokens: seq[int32]): GGTe
     else:
       g = silu(g)
     let u = amMatmul(w3, xNorm2)
-    let ffnOut = amMatmul(w2, GGTensor(at: (g.at * u.at)))
-    x.at = x.at + ffnOut.at
+    let ffnOut = amMatmul(w2, GGTensor(at: (g.at *. u.at)))
+    x.at = x.at +. ffnOut.at
 
   cache.curLen = tokens.len
   let normFinal = m.getTensor("output_norm.weight")
@@ -213,7 +213,7 @@ proc forwardNext*(m: var Model, cache: var KvCache, token: int32): GGTensor =
           attnOut[h * headDim + d, 0] += scores[i, 0] * cpuVCache[hkv * headDim + d, i]
 
     let attnOutG = GGTensor(at: attnOut.toDevice())
-    x.at = x.at + amMatmul(wo, attnOutG).at
+    x.at = x.at +. amMatmul(wo, attnOutG).at
 
     let ffnNorm = m.getTensor(prefix & "ffn_norm.weight")
     let w1 = m.getTensor(prefix & "ffn_gate.weight")
@@ -227,8 +227,8 @@ proc forwardNext*(m: var Model, cache: var KvCache, token: int32): GGTensor =
     else:
       g = silu(g)
     let u = amMatmul(w3, xNorm2)
-    let ffnOut = amMatmul(w2, GGTensor(at: (g.at * u.at)))
-    x.at = x.at + ffnOut.at
+    let ffnOut = amMatmul(w2, GGTensor(at: (g.at *. u.at)))
+    x.at = x.at +. ffnOut.at
 
   cache.curLen += 1
   let normFinal = m.getTensor("output_norm.weight")

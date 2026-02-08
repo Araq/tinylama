@@ -135,9 +135,21 @@ proc layernormCols*(x: GGTensor, weight: GGTensor, bias: GGTensor, eps: float32)
   result.at = res.toDevice()
 
 proc amMatmul*(a, b: GGTensor): GGTensor =
-  # a is [out, in], b is [in, seq]
-  # result is [out, seq]
-  result.at = a.at * b.at
+  # Robust matmul that handles potential transpositions in weights
+  # a is usually the weight [out, in] or [in, out]
+  # b is usually the hidden state [in, seq]
+  let sA = a.at.shape
+  let sB = b.at.shape
+
+  if sA[^1] == sB[0]:
+    result.at = a.at * b.at
+  elif sA[0] == sB[0]:
+    result.at = a.at.transpose() * b.at
+  elif sA[^1] == sB[^1]:
+    result.at = a.at * b.at.transpose()
+  else:
+    # Fallback, likely to throw shape mismatch error if still incompatible
+    result.at = a.at * b.at
 
 proc embeddingLookup*(weight: GGTensor, ids: seq[int]): GGTensor =
   let nEmb = weight.at.shape[1]
