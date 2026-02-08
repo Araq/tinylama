@@ -1,0 +1,12 @@
+models/
+
+# Nim build/cache outputs
+nimcache/
+.nimcache/
+
+# Local binaries
+src/tinylama
+bench/bench_tinylama
+
+# Benchmark captures
+bench/results/
