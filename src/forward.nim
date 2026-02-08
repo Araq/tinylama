@@ -65,7 +65,7 @@ when defined(useHippo):
       let outArray = cast[ptr UncheckedArray[float32]](outData)
       var acc = 0.0'f32
       for k in 0 ..< int(wCols):
-        acc += wArray[outRow * int(wCols) + k] * xArray[k * int(seqLen) + seqCol]
+        acc = acc + wArray[outRow * int(wCols) + k] * xArray[k * int(seqLen) + seqCol]
       outArray[outRow * int(seqLen) + seqCol] = acc
 
 when defined(useHippo):

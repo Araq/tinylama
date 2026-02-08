@@ -26,16 +26,11 @@ nim c -r -d:useMalebolgia -d:ThreadPoolSize=8 -d:FixedChanSize=16 \
 Optional Hippo backend (AMD/NVIDIA via Hippo runtime):
 
 ```bash
-nim cpp -r -d:useHippo --path:../hippo/src \
+nim cpp -r -d:useHippo -d:useMalloc --cc:hipcc --path:../hippo/src \
   src/tinylama.nim models/TinyLlama-1.1B-Chat-v1.0.Q2_K.gguf "hello" --max-new 16
 ```
 
-If you are missing HIP/CUDA toolchain programs, use Hippo's flake shell first:
-
-```bash
-nix develop ../hippo#all -c nim cpp -r -d:useHippo --path:../hippo/src \
-  src/tinylama.nim models/TinyLlama-1.1B-Chat-v1.0.Q2_K.gguf "hello" --max-new 16
-```
+For NVIDIA via HIP, set `HIP_PLATFORM=nvidia` before running this command.
 
 ## Download the tested model
 
@@ -79,7 +74,7 @@ nim c -r -d:release -d:useMalebolgia -d:ThreadPoolSize=8 -d:FixedChanSize=16 \
 Optional Hippo benchmark run:
 
 ```bash
-nim cpp -r -d:release -d:useHippo --path:../hippo/src \
+nim cpp -r -d:release -d:useHippo -d:useMalloc --cc:hipcc --path:../hippo/src \
   bench/bench_tinylama.nim models/TinyLlama-1.1B-Chat-v1.0.Q2_K.gguf
 ```
 
