@@ -59,16 +59,7 @@ Optional Malebolgia parallel run:
 
 ```bash
 nim c -r -d:release -d:useMalebolgia -d:ThreadPoolSize=8 -d:FixedChanSize=16 \
-  --path:/home/araq/projects/malebolgia/src \
   bench/bench_tinylama.nim models/TinyLlama-1.1B-Chat-v1.0.Q2_K.gguf
-```
-
-Suggested workflow for comparison:
-
-```bash
-mkdir -p bench/results
-nim c -r -d:release bench/bench_tinylama.nim models/TinyLlama-1.1B-Chat-v1.0.Q2_K.gguf \
-  | tee bench/results/$(date +%F)-baseline.txt
 ```
 
 ## Example

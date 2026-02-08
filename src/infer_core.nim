@@ -4,6 +4,7 @@ import ./tokenizer
 import ./tensor
 
 proc argmaxLast*(logits: Tensor, nVocab: int): int32 =
+  ## Return the best token id from the final logits position.
   if logits.shape.len != 2:
     raise newException(ValueError, "logits must be 2D")
   if logits.shape[0] == nVocab:
@@ -31,6 +32,7 @@ proc argmaxLast*(logits: Tensor, nVocab: int): int32 =
   raise newException(ValueError, "logits shape mismatch for vocab")
 
 proc encodePromptTokens*(vocab: Vocab, userText: string): seq[int32] =
+  ## Format chat input and tokenize it with special token handling.
   let fullPrompt = formatChatPrompt(vocab, userText)
   let useSpecial = fullPrompt != userText
   result = tokenizeWithSpecial(vocab, fullPrompt, addSpecial = not useSpecial)

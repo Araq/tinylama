@@ -3,14 +3,10 @@
 ## Usage:
 ##   nim c -r -d:release bench/bench_tinylama.nim models/model.gguf
 
-import std/[os, strutils]
-import benchy
-import ../src/gguf_loader
-import ../src/tokenizer
-import ../src/model
-import ../src/forward
-import ../src/infer_core
-import ../src/tensor
+import
+  std/[os],
+  benchy,
+  ../src/[forward, gguf_loader, infer_core, model, tensor, tokenizer]
 
 const
   shortPrompt = "Write one sentence about Nim."
@@ -20,6 +16,7 @@ const
   decodeSteps = 32
 
 proc cloneCache(src: KvCache): KvCache =
+  ## Deep-copy the KV cache so each benchmark starts from the same state.
   result.curLen = src.curLen
   result.maxLen = src.maxLen
   result.nHeadKv = src.nHeadKv
@@ -35,6 +32,7 @@ proc cloneCache(src: KvCache): KvCache =
       result.v[i].data[j] = src.v[i].data[j]
 
 proc main() =
+  ## Run benchmark cases for tokenization, prefill, and decode throughput.
   if paramCount() < 1:
     echo "usage: bench_tinylama <model.gguf>"
     quit(1)
