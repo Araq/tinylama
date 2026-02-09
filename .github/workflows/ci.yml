@@ -138,7 +138,8 @@ jobs:
       - name: Test Building tinylama
         run: |
           cd tinylama
+          nimble install -y
           mkdir -p models
           curl -L -o models/TinyLlama-1.1B-Chat-v1.0.Q2_K.gguf "https://huggingface.co/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/main/tinyllama-1.1b-chat-v1.0.Q2_K.gguf"
 
-          nim c -r src/tinylama.nim models/TinyLlama-1.1B-Chat-v1.0.Q2_K.gguf "what is the capital of France?" --max-new 32
+          nim c -r tests/tester.nim
