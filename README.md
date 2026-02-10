@@ -23,6 +23,25 @@ nim c -r -d:useMalebolgia -d:ThreadPoolSize=8 -d:FixedChanSize=16 \
   src/tinylama.nim models/TinyLlama-1.1B-Chat-v1.0.Q2_K.gguf "hello" --max-new 16
 ```
 
+Optional Hippo backend (HIP via hipcc, AMD):
+
+```bash
+HIP_PLATFORM=amd nim cpp -r -d:release --cc:hipcc \
+  -d:useHippo -d:useMalloc --path:../hippo/src \
+  src/tinylama.nim models/TinyLlama-1.1B-Chat-v1.0.Q2_K.gguf "hello" --max-new 16
+```
+
+Optional Hippo backend (CUDA via nvcc, NVIDIA):
+
+```bash
+NVCC_PREPEND_FLAGS="-arch=sm_86" nim cpp -r -d:release --cc:nvcc \
+  -d:useHippo -d:HippoRuntime=CUDA -d:useMalloc --path:../hippo/src \
+  src/tinylama.nim models/TinyLlama-1.1B-Chat-v1.0.Q2_K.gguf "hello" --max-new 16
+```
+
+This command was validated on AWS `g5.xlarge` (NVIDIA A10G, CUDA 13.1 toolkit).
+The `NVCC_PREPEND_FLAGS="-arch=sm_86"` setting avoids a PTX/runtime mismatch on this GPU.
+
 ## Download the tested model
 
 This project was tested with the TinyLlama 1.1B Q2_K GGUF.
@@ -35,7 +54,7 @@ curl -L -o models/TinyLlama-1.1B-Chat-v1.0.Q2_K.gguf \
 
 ## Notes
 
-- The current forward pass is CPU-only and naive (no batching, no optimizations).
+- The default forward pass is CPU and naive (no batching, no optimizations).
 - KV cache is enabled for decode steps to improve speed.
 - Only GGUF models with LLaMA architecture and supported quant types
   (Q2_K/Q3_K/Q6_K/F16/F32) are currently supported.
@@ -55,10 +74,39 @@ nim c -r -d:release bench/bench_tinylama.nim \
   models/TinyLlama-1.1B-Chat-v1.0.Q2_K.gguf
 ```
 
+Decode-focused benchmark options:
+
+```bash
+nim c -r -d:release bench/bench_tinylama.nim \
+  models/TinyLlama-1.1B-Chat-v1.0.Q2_K.gguf \
+  --decode-steps 32 --decode-warmup 2 --decode-runs 8
+```
+
+This prints a decode summary with:
+- best/mean total decode latency
+- best/mean `ms/token`
+- best/mean `tok/s`
+
 Optional Malebolgia parallel run:
 
 ```bash
 nim c -r -d:release -d:useMalebolgia -d:ThreadPoolSize=8 -d:FixedChanSize=16 \
+  bench/bench_tinylama.nim models/TinyLlama-1.1B-Chat-v1.0.Q2_K.gguf
+```
+
+Optional Hippo benchmark run (HIP via hipcc, AMD):
+
+```bash
+nim cpp -r -d:release --cc:hipcc \
+  -d:useHippo -d:useMalloc --path:../hippo/src \
+  bench/bench_tinylama.nim models/TinyLlama-1.1B-Chat-v1.0.Q2_K.gguf
+```
+
+Optional Hippo benchmark run (CUDA via nvcc, NVIDIA):
+
+```bash
+NVCC_PREPEND_FLAGS="-arch=sm_86" nim cpp -r -d:release --cc:nvcc \
+  -d:useHippo -d:HippoRuntime=CUDA -d:useMalloc --path:../hippo/src \
   bench/bench_tinylama.nim models/TinyLlama-1.1B-Chat-v1.0.Q2_K.gguf
 ```
 

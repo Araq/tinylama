@@ -1,10 +1,17 @@
 ## Minimal LLaMA-style forward pass (float32, CPU, no KV cache).
 
-import std/[math]
-import ./tensor
-import ./model
+import
+  std/[math],
+  ./[model, tensor]
+
+when defined(useHippo) and defined(useMalebolgia):
+  {.error: "useHippo and useMalebolgia are mutually exclusive. Choose one backend.".}
+
 when defined(useMalebolgia):
   import malebolgia
+
+when defined(useHippo):
+  import ./forward_hippo
 
 proc getTensorOr(m: var Model, a, b: string): Tensor =
   try:
@@ -38,7 +45,7 @@ proc embeddingLookup(weight: Tensor, tokens: seq[int32], nVocab, nEmb: int): Ten
     raise newException(ValueError, "embedding shape mismatch")
 
 proc linearGGMLCol(x: Tensor, w: Tensor): Tensor =
-  ## x: [in, seq], w stored as [in, out] but laid out row-major as rows=out, cols=in.
+  ## Multiply x and w using ggml column layout.
   if x.shape.len != 2 or w.shape.len != 2:
     raise newException(ValueError, "linear: expects 2D tensors")
   let inDim = x.shape[0]
@@ -47,8 +54,10 @@ proc linearGGMLCol(x: Tensor, w: Tensor): Tensor =
   let wRows = w.shape[1]   # out
   if wCols != inDim:
     raise newException(ValueError, "linear: input dim mismatch")
-  result = newTensor(@[wRows, seqLen])
-  when defined(useMalebolgia):
+  when defined(useHippo):
+    return linearHippoCol(x, w, wCols, wRows, seqLen)
+  elif defined(useMalebolgia):
+    result = newTensor(@[wRows, seqLen])
     proc linearChunk(startRow, endRow: int,
                      wData, xData, outData: ptr UncheckedArray[float32],
                      wCols, seqLen: int) {.gcsafe.} =
@@ -73,6 +82,7 @@ proc linearGGMLCol(x: Tensor, w: Tensor): Tensor =
         m.spawn linearChunk(start, stop, wData, xData, outData, wCols, seqLen)
         start = stop
   else:
+    result = newTensor(@[wRows, seqLen])
     for o in 0 ..< wRows:
       let wRow = o * wCols
       let outRow = o * seqLen
