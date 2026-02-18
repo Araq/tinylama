@@ -733,7 +733,6 @@ proc gpuLinearCol*(dst, x, w: pointer, wCols, wRows, seqLen: int,
 # ---------------------------------------------------------------------------
 # Legacy API: linearHippoCol (CPU tensor in/out, for backward compat)
 # ---------------------------------------------------------------------------
-var linearCallCount = 0
 
 proc linearHippoCol*(x: Tensor, w: Tensor, wCols, wRows, seqLen: int): Tensor =
   result = newTensor(@[wRows, seqLen])
@@ -760,25 +759,3 @@ proc linearHippoCol*(x: Tensor, w: Tensor, wCols, wRows, seqLen: int): Tensor =
   hippoMemcpyAsync(addr result.data[0], devOut, outBytes,
                     HippoMemcpyDeviceToHost, stream)
   hippoStreamSynchronize(stream)
-
-  # Debug: compare GPU result vs CPU for first few calls
-  inc linearCallCount
-  if linearCallCount <= 20:
-    var cpuResult = newTensor(@[wRows, seqLen])
-    for o in 0 ..< wRows:
-      let wRow = o * wCols
-      let outRow = o * seqLen
-      for s in 0 ..< seqLen:
-        var acc = 0.0'f32
-        for k in 0 ..< wCols:
-          acc += w.data[wRow + k] * x.data[k * seqLen + s]
-        cpuResult.data[outRow + s] = acc
-    var maxErr = 0.0'f32
-    for i in 0 ..< result.data.len:
-      let err = abs(result.data[i] - cpuResult.data[i])
-      if err > maxErr: maxErr = err
-    stderr.writeLine "GEMM #" & $linearCallCount & " wCols=" & $wCols &
-                      " wRows=" & $wRows & " seqLen=" & $seqLen &
-                      " maxErr=" & $maxErr &
-                      " gpu[0]=" & $result.data[0] &
-                      " cpu[0]=" & $cpuResult.data[0]
