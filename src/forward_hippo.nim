@@ -107,7 +107,7 @@ type
   GpuContext* = object
     initialized*: bool
     stream*: HippoStream
-    weights*: Table[uint, GpuTensor]
+    weights*: Table[string, GpuTensor]
     # Ping-pong activation buffers
     act0*: GpuTensor
     act1*: GpuTensor
@@ -123,7 +123,7 @@ var gpuCtx*: GpuContext
 proc ensureGpuContext*() =
   if not gpuCtx.initialized:
     gpuCtx.stream = hippoStreamCreate()
-    gpuCtx.weights = initTable[uint, GpuTensor]()
+    gpuCtx.weights = initTable[string, GpuTensor]()
     gpuCtx.initialized = true
 
 proc ensureActivationBuffers*(nElems: int) =
@@ -143,19 +143,20 @@ proc ensureScratchBuffers*(nElems: int) =
     gpuCtx.scratch2 = newGpuTensor(@[nElems])
     gpuCtx.scratchCapBytes = bytes
 
-proc tensorStorageKey(t: Tensor): uint =
-  if t.data.len == 0:
-    raise newException(ValueError, "cannot cache empty tensor storage")
-  cast[uint](unsafeAddr t.data[0])
+proc cachedWeight*(name: string, w: Tensor): GpuTensor =
+  ## Upload a named weight tensor to GPU once; return cached GpuTensor.
+  ensureGpuContext()
+  if gpuCtx.weights.hasKey(name):
+    return gpuCtx.weights[name]
+  let gt = uploadToGpu(w, gpuCtx.stream)
+  gpuCtx.weights[name] = gt
+  gt
 
 proc cachedWeight*(w: Tensor): GpuTensor =
-  ## Upload a weight tensor to GPU once; return cached GpuTensor.
+  ## Legacy fallback when a stable key is not available.
+  ## This path avoids incorrect cache aliasing by skipping persistent cache.
   ensureGpuContext()
-  let key = tensorStorageKey(w)
-  if gpuCtx.weights.hasKey(key):
-    return gpuCtx.weights[key]
   let gt = uploadToGpu(w, gpuCtx.stream)
-  gpuCtx.weights[key] = gt
   gt
 
 # ---------------------------------------------------------------------------

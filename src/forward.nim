@@ -289,7 +289,7 @@ when defined(useHippo):
     let stream = gpuCtx.stream
 
     let tokEmb = getTensorOr(m, "tok_embeddings.weight", "token_embd.weight")
-    let dTokEmb = cachedWeight(tokEmb)
+    let dTokEmb = cachedWeight("token_embd_or_tok_embeddings", tokEmb)
     let tokenPtr = gpuAllocAndUploadInt32(unsafeAddr tokens[0], seqLen, stream)
 
     var xPtr = gpuCtx.act0.devicePtr
@@ -312,15 +312,15 @@ when defined(useHippo):
       let wUp = m.getTensor("blk." & $layer & ".ffn_up.weight")
       let wDown = m.getTensor("blk." & $layer & ".ffn_down.weight")
 
-      let dAttnNorm = cachedWeight(attnNorm)
-      let dFfnNorm = cachedWeight(ffnNorm)
-      let dWq = cachedWeight(wq)
-      let dWk = cachedWeight(wk)
-      let dWv = cachedWeight(wv)
-      let dWo = cachedWeight(wo)
-      let dWGate = cachedWeight(wGate)
-      let dWUp = cachedWeight(wUp)
-      let dWDown = cachedWeight(wDown)
+      let dAttnNorm = cachedWeight("blk." & $layer & ".attn_norm.weight", attnNorm)
+      let dFfnNorm = cachedWeight("blk." & $layer & ".ffn_norm.weight", ffnNorm)
+      let dWq = cachedWeight("blk." & $layer & ".attn_q.weight", wq)
+      let dWk = cachedWeight("blk." & $layer & ".attn_k.weight", wk)
+      let dWv = cachedWeight("blk." & $layer & ".attn_v.weight", wv)
+      let dWo = cachedWeight("blk." & $layer & ".attn_output.weight", wo)
+      let dWGate = cachedWeight("blk." & $layer & ".ffn_gate.weight", wGate)
+      let dWUp = cachedWeight("blk." & $layer & ".ffn_up.weight", wUp)
+      let dWDown = cachedWeight("blk." & $layer & ".ffn_down.weight", wDown)
 
       gpuRmsnormCols(xNormPtr, xPtr, dAttnNorm.devicePtr, hp.nEmb, seqLen, hp.rmsEps, stream)
       gpuLinearCol(tmp0, xNormPtr, dWq.devicePtr, hp.nEmb, hp.nEmb, seqLen, stream)
@@ -346,8 +346,8 @@ when defined(useHippo):
 
     let norm = getTensorOr(m, "norm.weight", "output_norm.weight")
     let outW = outputWeightForLinear(m.getTensor("output.weight"), hp.nEmb, hp.nVocab)
-    let dNorm = cachedWeight(norm)
-    let dOutW = cachedWeight(outW)
+    let dNorm = cachedWeight("norm_or_output_norm.weight", norm)
+    let dOutW = cachedWeight("output.weight", outW)
 
     gpuRmsnormCols(xNormPtr, xPtr, dNorm.devicePtr, hp.nEmb, seqLen, hp.rmsEps, stream)
     gpuLinearCol(xPtr, xNormPtr, dOutW.devicePtr, outW.shape[0], outW.shape[1], seqLen, stream)
@@ -381,7 +381,7 @@ when defined(useHippo):
     let stream = gpuCtx.stream
 
     let tokEmb = getTensorOr(m, "tok_embeddings.weight", "token_embd.weight")
-    let dTokEmb = cachedWeight(tokEmb)
+    let dTokEmb = cachedWeight("token_embd_or_tok_embeddings", tokEmb)
     var tok = token
     let tokenPtr = gpuAllocAndUploadInt32(unsafeAddr tok, 1, stream)
 
@@ -405,15 +405,15 @@ when defined(useHippo):
       let wUp = m.getTensor("blk." & $layer & ".ffn_up.weight")
       let wDown = m.getTensor("blk." & $layer & ".ffn_down.weight")
 
-      let dAttnNorm = cachedWeight(attnNorm)
-      let dFfnNorm = cachedWeight(ffnNorm)
-      let dWq = cachedWeight(wq)
-      let dWk = cachedWeight(wk)
-      let dWv = cachedWeight(wv)
-      let dWo = cachedWeight(wo)
-      let dWGate = cachedWeight(wGate)
-      let dWUp = cachedWeight(wUp)
-      let dWDown = cachedWeight(wDown)
+      let dAttnNorm = cachedWeight("blk." & $layer & ".attn_norm.weight", attnNorm)
+      let dFfnNorm = cachedWeight("blk." & $layer & ".ffn_norm.weight", ffnNorm)
+      let dWq = cachedWeight("blk." & $layer & ".attn_q.weight", wq)
+      let dWk = cachedWeight("blk." & $layer & ".attn_k.weight", wk)
+      let dWv = cachedWeight("blk." & $layer & ".attn_v.weight", wv)
+      let dWo = cachedWeight("blk." & $layer & ".attn_output.weight", wo)
+      let dWGate = cachedWeight("blk." & $layer & ".ffn_gate.weight", wGate)
+      let dWUp = cachedWeight("blk." & $layer & ".ffn_up.weight", wUp)
+      let dWDown = cachedWeight("blk." & $layer & ".ffn_down.weight", wDown)
 
       gpuRmsnormCols(xNormPtr, xPtr, dAttnNorm.devicePtr, hp.nEmb, 1, hp.rmsEps, stream)
       gpuLinearCol(tmp0, xNormPtr, dWq.devicePtr, hp.nEmb, hp.nEmb, 1, stream)
@@ -441,8 +441,8 @@ when defined(useHippo):
 
     let norm = getTensorOr(m, "norm.weight", "output_norm.weight")
     let outW = outputWeightForLinear(m.getTensor("output.weight"), hp.nEmb, hp.nVocab)
-    let dNorm = cachedWeight(norm)
-    let dOutW = cachedWeight(outW)
+    let dNorm = cachedWeight("norm_or_output_norm.weight", norm)
+    let dOutW = cachedWeight("output.weight", outW)
 
     gpuRmsnormCols(xNormPtr, xPtr, dNorm.devicePtr, hp.nEmb, 1, hp.rmsEps, stream)
     gpuLinearCol(xPtr, xNormPtr, dOutW.devicePtr, outW.shape[0], outW.shape[1], 1, stream)

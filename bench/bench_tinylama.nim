@@ -17,9 +17,9 @@ const
   longPrompt =
     "Explain transformers in simple terms, then give a compact example " &
     "of how token-by-token decoding works."
-  defaultDecodeSteps = 32
+  defaultDecodeSteps = 16
   defaultDecodeWarmup = 1
-  defaultDecodeRuns = 4
+  defaultDecodeRuns = 2
 
 proc nowMs(): float64 =
   ## Return the current monotonic time in milliseconds.
