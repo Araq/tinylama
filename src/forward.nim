@@ -254,90 +254,297 @@ proc storeKVRange(cache: var KvCache, layer: int, startPos: int, k, v: Tensor) =
       cache.k[layer].data[dst + c] = k.data[src + c]
       cache.v[layer].data[dst + c] = v.data[src + c]
 
+when defined(useHippo):
+  proc outputWeightForLinear(w: Tensor, nEmb, nVocab: int): Tensor =
+    if w.shape.len != 2:
+      raise newException(ValueError, "output weight must be 2D")
+    let a0 = w.shape[0]
+    let a1 = w.shape[1]
+    if a0 == nEmb and a1 == nVocab:
+      return w
+    if a0 == nVocab and a1 == nEmb:
+      return w.reshape(@[a1, a0])
+    raise newException(ValueError, "output weight shape mismatch")
+
+  proc forwardPrefillHippo(m: var Model, tokens: seq[int32], cache: var KvCache): Tensor =
+    let hp = m.hparams
+    if hp.arch != "" and hp.arch != "llama":
+      raise newException(ValueError, "unsupported architecture: " & hp.arch)
+    if hp.nHeadKv != 0 and (hp.nHead mod hp.nHeadKv) != 0:
+      raise newException(ValueError, "GQA requires head_count divisible by head_count_kv")
+    if tokens.len == 0:
+      raise newException(ValueError, "prefill requires at least one token")
+    if tokens.len > cache.maxLen:
+      raise newException(ValueError, "prefill exceeds KV cache capacity")
+
+    let headDim = hp.nEmb div hp.nHead
+    let ropeDim = if hp.ropeDim > 0: hp.ropeDim else: headDim
+    let kvDim = hp.nHeadKv * headDim
+    let seqLen = tokens.len
+
+    ensureGpuContext()
+    let maxRows = max(max(hp.nEmb, hp.nFfn), hp.nVocab)
+    ensureActivationBuffers(maxRows * seqLen)
+    ensureScratchBuffers(maxRows * seqLen)
+    let stream = gpuCtx.stream
+
+    let tokEmb = getTensorOr(m, "tok_embeddings.weight", "token_embd.weight")
+    let dTokEmb = cachedWeight(tokEmb)
+    let tokenPtr = gpuAllocAndUploadInt32(unsafeAddr tokens[0], seqLen, stream)
+
+    var xPtr = gpuCtx.act0.devicePtr
+    let xNormPtr = gpuCtx.act1.devicePtr
+    let tmp0 = gpuCtx.scratch0.devicePtr
+    let tmp1 = gpuCtx.scratch1.devicePtr
+    let tmp2 = gpuCtx.scratch2.devicePtr
+
+    gpuEmbedding(xPtr, dTokEmb.devicePtr, cast[ptr int32](tokenPtr),
+                 hp.nEmb, seqLen, hp.nVocab, stream)
+
+    for layer in 0 ..< hp.nLayer:
+      let attnNorm = m.getTensor("blk." & $layer & ".attn_norm.weight")
+      let ffnNorm = m.getTensor("blk." & $layer & ".ffn_norm.weight")
+      let wq = m.getTensor("blk." & $layer & ".attn_q.weight")
+      let wk = m.getTensor("blk." & $layer & ".attn_k.weight")
+      let wv = m.getTensor("blk." & $layer & ".attn_v.weight")
+      let wo = m.getTensor("blk." & $layer & ".attn_output.weight")
+      let wGate = m.getTensor("blk." & $layer & ".ffn_gate.weight")
+      let wUp = m.getTensor("blk." & $layer & ".ffn_up.weight")
+      let wDown = m.getTensor("blk." & $layer & ".ffn_down.weight")
+
+      let dAttnNorm = cachedWeight(attnNorm)
+      let dFfnNorm = cachedWeight(ffnNorm)
+      let dWq = cachedWeight(wq)
+      let dWk = cachedWeight(wk)
+      let dWv = cachedWeight(wv)
+      let dWo = cachedWeight(wo)
+      let dWGate = cachedWeight(wGate)
+      let dWUp = cachedWeight(wUp)
+      let dWDown = cachedWeight(wDown)
+
+      gpuRmsnormCols(xNormPtr, xPtr, dAttnNorm.devicePtr, hp.nEmb, seqLen, hp.rmsEps, stream)
+      gpuLinearCol(tmp0, xNormPtr, dWq.devicePtr, hp.nEmb, hp.nEmb, seqLen, stream)
+      gpuLinearCol(tmp1, xNormPtr, dWk.devicePtr, hp.nEmb, kvDim, seqLen, stream)
+      gpuLinearCol(tmp2, xNormPtr, dWv.devicePtr, hp.nEmb, kvDim, seqLen, stream)
+      gpuRopeAtPos(tmp0, hp.nHead, headDim, ropeDim, hp.ropeFreqBase, 0, seqLen, stream)
+      gpuRopeAtPos(tmp1, hp.nHeadKv, headDim, ropeDim, hp.ropeFreqBase, 0, seqLen, stream)
+
+      gpuStoreKV(cache.gpuCache.k[layer].devicePtr, tmp1, kvDim, seqLen, cache.gpuCache.maxLen, 0, stream)
+      gpuStoreKV(cache.gpuCache.v[layer].devicePtr, tmp2, kvDim, seqLen, cache.gpuCache.maxLen, 0, stream)
+
+      gpuAttentionPrefill(xNormPtr, tmp0, tmp1, tmp2,
+                          hp.nHead, hp.nHeadKv, headDim, seqLen, stream)
+      gpuLinearCol(tmp0, xNormPtr, dWo.devicePtr, hp.nEmb, hp.nEmb, seqLen, stream)
+      gpuAdd(xPtr, xPtr, tmp0, hp.nEmb * seqLen, stream)
+
+      gpuRmsnormCols(xNormPtr, xPtr, dFfnNorm.devicePtr, hp.nEmb, seqLen, hp.rmsEps, stream)
+      gpuLinearCol(tmp0, xNormPtr, dWGate.devicePtr, hp.nEmb, hp.nFfn, seqLen, stream)
+      gpuLinearCol(tmp1, xNormPtr, dWUp.devicePtr, hp.nEmb, hp.nFfn, seqLen, stream)
+      gpuSiluMul(tmp2, tmp0, tmp1, hp.nFfn * seqLen, stream)
+      gpuLinearCol(tmp0, tmp2, dWDown.devicePtr, hp.nFfn, hp.nEmb, seqLen, stream)
+      gpuAdd(xPtr, xPtr, tmp0, hp.nEmb * seqLen, stream)
+
+    let norm = getTensorOr(m, "norm.weight", "output_norm.weight")
+    let outW = outputWeightForLinear(m.getTensor("output.weight"), hp.nEmb, hp.nVocab)
+    let dNorm = cachedWeight(norm)
+    let dOutW = cachedWeight(outW)
+
+    gpuRmsnormCols(xNormPtr, xPtr, dNorm.devicePtr, hp.nEmb, seqLen, hp.rmsEps, stream)
+    gpuLinearCol(xPtr, xNormPtr, dOutW.devicePtr, outW.shape[0], outW.shape[1], seqLen, stream)
+
+    result = newTensor(@[outW.shape[1], seqLen])
+    let bytes = result.data.len * sizeof(float32)
+    gpuDownloadFromDevice(addr result.data[0], xPtr, bytes, stream)
+    gpuStreamSync(stream)
+
+    cache.curLen = seqLen
+    cache.gpuCache.curLen = seqLen
+
+  proc forwardDecodeHippo(m: var Model, token: int32, cache: var KvCache): Tensor =
+    let hp = m.hparams
+    if hp.arch != "" and hp.arch != "llama":
+      raise newException(ValueError, "unsupported architecture: " & hp.arch)
+    if hp.nHeadKv != 0 and (hp.nHead mod hp.nHeadKv) != 0:
+      raise newException(ValueError, "GQA requires head_count divisible by head_count_kv")
+    if cache.curLen >= cache.maxLen:
+      raise newException(ValueError, "KV cache full")
+
+    let headDim = hp.nEmb div hp.nHead
+    let ropeDim = if hp.ropeDim > 0: hp.ropeDim else: headDim
+    let kvDim = hp.nHeadKv * headDim
+    let pos = cache.curLen
+
+    ensureGpuContext()
+    let maxRows = max(max(hp.nEmb, hp.nFfn), hp.nVocab)
+    ensureActivationBuffers(maxRows)
+    ensureScratchBuffers(maxRows)
+    let stream = gpuCtx.stream
+
+    let tokEmb = getTensorOr(m, "tok_embeddings.weight", "token_embd.weight")
+    let dTokEmb = cachedWeight(tokEmb)
+    var tok = token
+    let tokenPtr = gpuAllocAndUploadInt32(unsafeAddr tok, 1, stream)
+
+    var xPtr = gpuCtx.act0.devicePtr
+    let xNormPtr = gpuCtx.act1.devicePtr
+    let tmp0 = gpuCtx.scratch0.devicePtr
+    let tmp1 = gpuCtx.scratch1.devicePtr
+    let tmp2 = gpuCtx.scratch2.devicePtr
+
+    gpuEmbedding(xPtr, dTokEmb.devicePtr, cast[ptr int32](tokenPtr),
+                 hp.nEmb, 1, hp.nVocab, stream)
+
+    for layer in 0 ..< hp.nLayer:
+      let attnNorm = m.getTensor("blk." & $layer & ".attn_norm.weight")
+      let ffnNorm = m.getTensor("blk." & $layer & ".ffn_norm.weight")
+      let wq = m.getTensor("blk." & $layer & ".attn_q.weight")
+      let wk = m.getTensor("blk." & $layer & ".attn_k.weight")
+      let wv = m.getTensor("blk." & $layer & ".attn_v.weight")
+      let wo = m.getTensor("blk." & $layer & ".attn_output.weight")
+      let wGate = m.getTensor("blk." & $layer & ".ffn_gate.weight")
+      let wUp = m.getTensor("blk." & $layer & ".ffn_up.weight")
+      let wDown = m.getTensor("blk." & $layer & ".ffn_down.weight")
+
+      let dAttnNorm = cachedWeight(attnNorm)
+      let dFfnNorm = cachedWeight(ffnNorm)
+      let dWq = cachedWeight(wq)
+      let dWk = cachedWeight(wk)
+      let dWv = cachedWeight(wv)
+      let dWo = cachedWeight(wo)
+      let dWGate = cachedWeight(wGate)
+      let dWUp = cachedWeight(wUp)
+      let dWDown = cachedWeight(wDown)
+
+      gpuRmsnormCols(xNormPtr, xPtr, dAttnNorm.devicePtr, hp.nEmb, 1, hp.rmsEps, stream)
+      gpuLinearCol(tmp0, xNormPtr, dWq.devicePtr, hp.nEmb, hp.nEmb, 1, stream)
+      gpuLinearCol(tmp1, xNormPtr, dWk.devicePtr, hp.nEmb, kvDim, 1, stream)
+      gpuLinearCol(tmp2, xNormPtr, dWv.devicePtr, hp.nEmb, kvDim, 1, stream)
+      gpuRopeAtPos(tmp0, hp.nHead, headDim, ropeDim, hp.ropeFreqBase, pos, 1, stream)
+      gpuRopeAtPos(tmp1, hp.nHeadKv, headDim, ropeDim, hp.ropeFreqBase, pos, 1, stream)
+
+      gpuStoreKV(cache.gpuCache.k[layer].devicePtr, tmp1, kvDim, 1, cache.gpuCache.maxLen, pos, stream)
+      gpuStoreKV(cache.gpuCache.v[layer].devicePtr, tmp2, kvDim, 1, cache.gpuCache.maxLen, pos, stream)
+
+      gpuAttentionDecode(xNormPtr, tmp0, cache.gpuCache.k[layer].devicePtr,
+                         cache.gpuCache.v[layer].devicePtr,
+                         hp.nHead, hp.nHeadKv, headDim, pos + 1,
+                         cache.gpuCache.maxLen, stream)
+      gpuLinearCol(tmp0, xNormPtr, dWo.devicePtr, hp.nEmb, hp.nEmb, 1, stream)
+      gpuAdd(xPtr, xPtr, tmp0, hp.nEmb, stream)
+
+      gpuRmsnormCols(xNormPtr, xPtr, dFfnNorm.devicePtr, hp.nEmb, 1, hp.rmsEps, stream)
+      gpuLinearCol(tmp0, xNormPtr, dWGate.devicePtr, hp.nEmb, hp.nFfn, 1, stream)
+      gpuLinearCol(tmp1, xNormPtr, dWUp.devicePtr, hp.nEmb, hp.nFfn, 1, stream)
+      gpuSiluMul(tmp2, tmp0, tmp1, hp.nFfn, stream)
+      gpuLinearCol(tmp0, tmp2, dWDown.devicePtr, hp.nFfn, hp.nEmb, 1, stream)
+      gpuAdd(xPtr, xPtr, tmp0, hp.nEmb, stream)
+
+    let norm = getTensorOr(m, "norm.weight", "output_norm.weight")
+    let outW = outputWeightForLinear(m.getTensor("output.weight"), hp.nEmb, hp.nVocab)
+    let dNorm = cachedWeight(norm)
+    let dOutW = cachedWeight(outW)
+
+    gpuRmsnormCols(xNormPtr, xPtr, dNorm.devicePtr, hp.nEmb, 1, hp.rmsEps, stream)
+    gpuLinearCol(xPtr, xNormPtr, dOutW.devicePtr, outW.shape[0], outW.shape[1], 1, stream)
+
+    result = newTensor(@[outW.shape[1], 1])
+    let bytes = result.data.len * sizeof(float32)
+    gpuDownloadFromDevice(addr result.data[0], xPtr, bytes, stream)
+    gpuStreamSync(stream)
+
+    cache.curLen = pos + 1
+    cache.gpuCache.curLen = cache.curLen
+
 proc forwardPrefill*(m: var Model, tokens: seq[int32], cache: var KvCache): Tensor =
-  let hp = m.hparams
-  if hp.arch != "" and hp.arch != "llama":
-    raise newException(ValueError, "unsupported architecture: " & hp.arch)
-  if hp.nHeadKv != 0 and (hp.nHead mod hp.nHeadKv) != 0:
-    raise newException(ValueError, "GQA requires head_count divisible by head_count_kv")
-  let headDim = hp.nEmb div hp.nHead
-  let ropeDim = if hp.ropeDim > 0: hp.ropeDim else: headDim
+  when defined(useHippo):
+    return forwardPrefillHippo(m, tokens, cache)
+  else:
+    let hp = m.hparams
+    if hp.arch != "" and hp.arch != "llama":
+      raise newException(ValueError, "unsupported architecture: " & hp.arch)
+    if hp.nHeadKv != 0 and (hp.nHead mod hp.nHeadKv) != 0:
+      raise newException(ValueError, "GQA requires head_count divisible by head_count_kv")
+    let headDim = hp.nEmb div hp.nHead
+    let ropeDim = if hp.ropeDim > 0: hp.ropeDim else: headDim
 
-  let tokEmb = getTensorOr(m, "tok_embeddings.weight", "token_embd.weight")
-  var x = embeddingLookup(tokEmb, tokens, hp.nVocab, hp.nEmb)
-  cache.curLen = tokens.len
+    let tokEmb = getTensorOr(m, "tok_embeddings.weight", "token_embd.weight")
+    var x = embeddingLookup(tokEmb, tokens, hp.nVocab, hp.nEmb)
+    cache.curLen = tokens.len
 
-  for layer in 0 ..< hp.nLayer:
-    let attnNorm = m.getTensor("blk." & $layer & ".attn_norm.weight")
-    let ffnNorm = m.getTensor("blk." & $layer & ".ffn_norm.weight")
-    let wq = m.getTensor("blk." & $layer & ".attn_q.weight")
-    let wk = m.getTensor("blk." & $layer & ".attn_k.weight")
-    let wv = m.getTensor("blk." & $layer & ".attn_v.weight")
-    let wo = m.getTensor("blk." & $layer & ".attn_output.weight")
-    let wGate = m.getTensor("blk." & $layer & ".ffn_gate.weight")
-    let wUp = m.getTensor("blk." & $layer & ".ffn_up.weight")
-    let wDown = m.getTensor("blk." & $layer & ".ffn_down.weight")
+    for layer in 0 ..< hp.nLayer:
+      let attnNorm = m.getTensor("blk." & $layer & ".attn_norm.weight")
+      let ffnNorm = m.getTensor("blk." & $layer & ".ffn_norm.weight")
+      let wq = m.getTensor("blk." & $layer & ".attn_q.weight")
+      let wk = m.getTensor("blk." & $layer & ".attn_k.weight")
+      let wv = m.getTensor("blk." & $layer & ".attn_v.weight")
+      let wo = m.getTensor("blk." & $layer & ".attn_output.weight")
+      let wGate = m.getTensor("blk." & $layer & ".ffn_gate.weight")
+      let wUp = m.getTensor("blk." & $layer & ".ffn_up.weight")
+      let wDown = m.getTensor("blk." & $layer & ".ffn_down.weight")
 
-    let xNorm = rmsnormCols(x, attnNorm, hp.rmsEps)
-    var q = linearGGMLCol(xNorm, wq)
-    var k = linearGGMLCol(xNorm, wk)
-    let v = linearGGMLCol(xNorm, wv)
-    applyRopeSingle(q, hp.nHead, headDim, ropeDim, hp.ropeFreqBase)
-    applyRopeSingle(k, hp.nHeadKv, headDim, ropeDim, hp.ropeFreqBase)
-    storeKVRange(cache, layer, 0, k, v)
-    let attnOut = attentionFull(q, k, v, wo, hp.nHead, hp.nHeadKv, headDim)
-    x = add(x, attnOut)
+      let xNorm = rmsnormCols(x, attnNorm, hp.rmsEps)
+      var q = linearGGMLCol(xNorm, wq)
+      var k = linearGGMLCol(xNorm, wk)
+      let v = linearGGMLCol(xNorm, wv)
+      applyRopeSingle(q, hp.nHead, headDim, ropeDim, hp.ropeFreqBase)
+      applyRopeSingle(k, hp.nHeadKv, headDim, ropeDim, hp.ropeFreqBase)
+      storeKVRange(cache, layer, 0, k, v)
+      let attnOut = attentionFull(q, k, v, wo, hp.nHead, hp.nHeadKv, headDim)
+      x = add(x, attnOut)
 
-    let xNorm2 = rmsnormCols(x, ffnNorm, hp.rmsEps)
-    let ffnOut = ffn(xNorm2, wGate, wUp, wDown)
-    x = add(x, ffnOut)
+      let xNorm2 = rmsnormCols(x, ffnNorm, hp.rmsEps)
+      let ffnOut = ffn(xNorm2, wGate, wUp, wDown)
+      x = add(x, ffnOut)
 
-  let norm = getTensorOr(m, "norm.weight", "output_norm.weight")
-  let outW = m.getTensor("output.weight")
-  let xNormFinal = rmsnormCols(x, norm, hp.rmsEps)
-  result = linearOut(xNormFinal, outW, hp.nEmb, hp.nVocab)
+    let norm = getTensorOr(m, "norm.weight", "output_norm.weight")
+    let outW = m.getTensor("output.weight")
+    let xNormFinal = rmsnormCols(x, norm, hp.rmsEps)
+    result = linearOut(xNormFinal, outW, hp.nEmb, hp.nVocab)
 
 proc forwardDecode*(m: var Model, token: int32, cache: var KvCache): Tensor =
-  let hp = m.hparams
-  if hp.arch != "" and hp.arch != "llama":
-    raise newException(ValueError, "unsupported architecture: " & hp.arch)
-  if cache.curLen >= cache.maxLen:
-    raise newException(ValueError, "KV cache full")
-  let headDim = hp.nEmb div hp.nHead
-  let ropeDim = if hp.ropeDim > 0: hp.ropeDim else: headDim
+  when defined(useHippo):
+    return forwardDecodeHippo(m, token, cache)
+  else:
+    let hp = m.hparams
+    if hp.arch != "" and hp.arch != "llama":
+      raise newException(ValueError, "unsupported architecture: " & hp.arch)
+    if cache.curLen >= cache.maxLen:
+      raise newException(ValueError, "KV cache full")
+    let headDim = hp.nEmb div hp.nHead
+    let ropeDim = if hp.ropeDim > 0: hp.ropeDim else: headDim
 
-  let tokEmb = getTensorOr(m, "tok_embeddings.weight", "token_embd.weight")
-  var x = embeddingLookup(tokEmb, @[token], hp.nVocab, hp.nEmb)
-  let pos = cache.curLen
+    let tokEmb = getTensorOr(m, "tok_embeddings.weight", "token_embd.weight")
+    var x = embeddingLookup(tokEmb, @[token], hp.nVocab, hp.nEmb)
+    let pos = cache.curLen
 
-  for layer in 0 ..< hp.nLayer:
-    let attnNorm = m.getTensor("blk." & $layer & ".attn_norm.weight")
-    let ffnNorm = m.getTensor("blk." & $layer & ".ffn_norm.weight")
-    let wq = m.getTensor("blk." & $layer & ".attn_q.weight")
-    let wk = m.getTensor("blk." & $layer & ".attn_k.weight")
-    let wv = m.getTensor("blk." & $layer & ".attn_v.weight")
-    let wo = m.getTensor("blk." & $layer & ".attn_output.weight")
-    let wGate = m.getTensor("blk." & $layer & ".ffn_gate.weight")
-    let wUp = m.getTensor("blk." & $layer & ".ffn_up.weight")
-    let wDown = m.getTensor("blk." & $layer & ".ffn_down.weight")
+    for layer in 0 ..< hp.nLayer:
+      let attnNorm = m.getTensor("blk." & $layer & ".attn_norm.weight")
+      let ffnNorm = m.getTensor("blk." & $layer & ".ffn_norm.weight")
+      let wq = m.getTensor("blk." & $layer & ".attn_q.weight")
+      let wk = m.getTensor("blk." & $layer & ".attn_k.weight")
+      let wv = m.getTensor("blk." & $layer & ".attn_v.weight")
+      let wo = m.getTensor("blk." & $layer & ".attn_output.weight")
+      let wGate = m.getTensor("blk." & $layer & ".ffn_gate.weight")
+      let wUp = m.getTensor("blk." & $layer & ".ffn_up.weight")
+      let wDown = m.getTensor("blk." & $layer & ".ffn_down.weight")
 
-    let xNorm = rmsnormCols(x, attnNorm, hp.rmsEps)
-    var q = linearGGMLCol(xNorm, wq)
-    var k = linearGGMLCol(xNorm, wk)
-    let v = linearGGMLCol(xNorm, wv)
-    applyRopeAtPos(q, hp.nHead, headDim, ropeDim, hp.ropeFreqBase, pos)
-    applyRopeAtPos(k, hp.nHeadKv, headDim, ropeDim, hp.ropeFreqBase, pos)
-    storeKVRange(cache, layer, pos, k, v)
-    let attnCtx = attentionCached(q, cache.k[layer], cache.v[layer], pos + 1, hp.nHead, hp.nHeadKv, headDim)
-    let attnOut = linearGGMLCol(attnCtx, wo)
-    x = add(x, attnOut)
+      let xNorm = rmsnormCols(x, attnNorm, hp.rmsEps)
+      var q = linearGGMLCol(xNorm, wq)
+      var k = linearGGMLCol(xNorm, wk)
+      let v = linearGGMLCol(xNorm, wv)
+      applyRopeAtPos(q, hp.nHead, headDim, ropeDim, hp.ropeFreqBase, pos)
+      applyRopeAtPos(k, hp.nHeadKv, headDim, ropeDim, hp.ropeFreqBase, pos)
+      storeKVRange(cache, layer, pos, k, v)
+      let attnCtx = attentionCached(q, cache.k[layer], cache.v[layer], pos + 1, hp.nHead, hp.nHeadKv, headDim)
+      let attnOut = linearGGMLCol(attnCtx, wo)
+      x = add(x, attnOut)
 
-    let xNorm2 = rmsnormCols(x, ffnNorm, hp.rmsEps)
-    let ffnOut = ffn(xNorm2, wGate, wUp, wDown)
-    x = add(x, ffnOut)
+      let xNorm2 = rmsnormCols(x, ffnNorm, hp.rmsEps)
+      let ffnOut = ffn(xNorm2, wGate, wUp, wDown)
+      x = add(x, ffnOut)
 
-  cache.curLen = pos + 1
-  let norm = getTensorOr(m, "norm.weight", "output_norm.weight")
-  let outW = m.getTensor("output.weight")
-  let xNormFinal = rmsnormCols(x, norm, hp.rmsEps)
-  result = linearOut(xNormFinal, outW, hp.nEmb, hp.nVocab)
+    cache.curLen = pos + 1
+    let norm = getTensorOr(m, "norm.weight", "output_norm.weight")
+    let outW = m.getTensor("output.weight")
+    let xNormFinal = rmsnormCols(x, norm, hp.rmsEps)
+    result = linearOut(xNormFinal, outW, hp.nEmb, hp.nVocab)

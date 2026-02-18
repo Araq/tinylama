@@ -9,6 +9,9 @@ import
   benchy,
   ../src/[forward, gguf_loader, infer_core, model, tensor, tokenizer]
 
+when defined(useHippo):
+  import ../src/forward_hippo
+
 const
   shortPrompt = "Write one sentence about Nim."
   longPrompt =
@@ -57,6 +60,15 @@ proc cloneCache(src: KvCache): KvCache =
       result.k[i].data[j] = src.k[i].data[j]
     for j in 0 ..< src.v[i].data.len:
       result.v[i].data[j] = src.v[i].data[j]
+  when defined(useHippo):
+    result.gpuCache = initGpuKvCache(src.k.len, src.nHeadKv, src.headDim, src.maxLen)
+    result.gpuCache.curLen = src.gpuCache.curLen
+    let stream = gpuCtx.stream
+    for i in 0 ..< src.k.len:
+      let bytes = src.k[i].data.len * sizeof(float32)
+      gpuMemcpyDevice(result.gpuCache.k[i].devicePtr, src.gpuCache.k[i].devicePtr, bytes, stream)
+      gpuMemcpyDevice(result.gpuCache.v[i].devicePtr, src.gpuCache.v[i].devicePtr, bytes, stream)
+    gpuStreamSync(stream)
 
 proc runDecodeSteps(
   m: var Model,
