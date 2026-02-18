@@ -100,6 +100,8 @@ type
     maxLen*: int
     nHeadKv*: int
     headDim*: int
+    when defined(useHippo):
+      gpuCache*: GpuKvCache
 
 proc initKvCache*(hp: HParams, maxLen: int): KvCache =
   if hp.nHead <= 0:
@@ -114,6 +116,8 @@ proc initKvCache*(hp: HParams, maxLen: int): KvCache =
   for i in 0 ..< hp.nLayer:
     result.k[i] = newTensor(@[kvDim, maxLen])
     result.v[i] = newTensor(@[kvDim, maxLen])
+  when defined(useHippo):
+    result.gpuCache = initGpuKvCache(hp.nLayer, hp.nHeadKv, result.headDim, maxLen)
 
 proc applyRopeSingle(x: var Tensor, nHead, headDim, ropeDim: int, base: float32) =
   let seqLen = x.shape[1]
