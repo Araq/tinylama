@@ -4,6 +4,10 @@ import
   std/[math],
   ./[model, tensor]
 
+when defined(profileHippo):
+  import std/[times, strutils]
+  import hippo
+
 when defined(useHippo) and defined(useMalebolgia):
   {.error: "useHippo and useMalebolgia are mutually exclusive. Choose one backend.".}
 
@@ -302,25 +306,16 @@ when defined(useHippo):
                  hp.nEmb, seqLen, hp.nVocab, stream)
 
     for layer in 0 ..< hp.nLayer:
-      let attnNorm = m.getTensor("blk." & $layer & ".attn_norm.weight")
-      let ffnNorm = m.getTensor("blk." & $layer & ".ffn_norm.weight")
-      let wq = m.getTensor("blk." & $layer & ".attn_q.weight")
-      let wk = m.getTensor("blk." & $layer & ".attn_k.weight")
-      let wv = m.getTensor("blk." & $layer & ".attn_v.weight")
-      let wo = m.getTensor("blk." & $layer & ".attn_output.weight")
-      let wGate = m.getTensor("blk." & $layer & ".ffn_gate.weight")
-      let wUp = m.getTensor("blk." & $layer & ".ffn_up.weight")
-      let wDown = m.getTensor("blk." & $layer & ".ffn_down.weight")
-
-      let dAttnNorm = cachedWeight("blk." & $layer & ".attn_norm.weight", attnNorm)
-      let dFfnNorm = cachedWeight("blk." & $layer & ".ffn_norm.weight", ffnNorm)
-      let dWq = cachedWeight("blk." & $layer & ".attn_q.weight", wq)
-      let dWk = cachedWeight("blk." & $layer & ".attn_k.weight", wk)
-      let dWv = cachedWeight("blk." & $layer & ".attn_v.weight", wv)
-      let dWo = cachedWeight("blk." & $layer & ".attn_output.weight", wo)
-      let dWGate = cachedWeight("blk." & $layer & ".ffn_gate.weight", wGate)
-      let dWUp = cachedWeight("blk." & $layer & ".ffn_up.weight", wUp)
-      let dWDown = cachedWeight("blk." & $layer & ".ffn_down.weight", wDown)
+      let lp = "blk." & $layer & "."
+      let dAttnNorm = cachedWeight(lp & "attn_norm.weight", m.getTensor(lp & "attn_norm.weight"))
+      let dFfnNorm = cachedWeight(lp & "ffn_norm.weight", m.getTensor(lp & "ffn_norm.weight"))
+      let dWq = cachedWeight(lp & "attn_q.weight", m.getTensor(lp & "attn_q.weight"))
+      let dWk = cachedWeight(lp & "attn_k.weight", m.getTensor(lp & "attn_k.weight"))
+      let dWv = cachedWeight(lp & "attn_v.weight", m.getTensor(lp & "attn_v.weight"))
+      let dWo = cachedWeight(lp & "attn_output.weight", m.getTensor(lp & "attn_output.weight"))
+      let dWGate = cachedWeight(lp & "ffn_gate.weight", m.getTensor(lp & "ffn_gate.weight"))
+      let dWUp = cachedWeight(lp & "ffn_up.weight", m.getTensor(lp & "ffn_up.weight"))
+      let dWDown = cachedWeight(lp & "ffn_down.weight", m.getTensor(lp & "ffn_down.weight"))
 
       gpuRmsnormCols(xNormPtr, xPtr, dAttnNorm.devicePtr, hp.nEmb, seqLen, hp.rmsEps, stream)
       gpuLinearCol(tmp0, xNormPtr, dWq.devicePtr, hp.nEmb, hp.nEmb, seqLen, stream)
@@ -380,6 +375,12 @@ when defined(useHippo):
     ensureScratchBuffers(maxRows)
     let stream = gpuCtx.stream
 
+    when defined(profileHippo):
+      let wallStart = epochTime()
+      let gpuStartEvt = hippoEventCreate()
+      let gpuEndEvt = hippoEventCreate()
+      hippoEventRecord(gpuStartEvt, stream)
+
     let tokEmb = getTensorOr(m, "tok_embeddings.weight", "token_embd.weight")
     let dTokEmb = cachedWeight("token_embd_or_tok_embeddings", tokEmb)
     var tok = token
@@ -394,27 +395,30 @@ when defined(useHippo):
     gpuEmbedding(xPtr, dTokEmb.devicePtr, cast[ptr int32](tokenPtr),
                  hp.nEmb, 1, hp.nVocab, stream)
 
+    when defined(profileHippo):
+      var getTensorMs = 0.0
+      var cachedWeightMs = 0.0
+      var kernelLaunchMs = 0.0
+
     for layer in 0 ..< hp.nLayer:
-      let attnNorm = m.getTensor("blk." & $layer & ".attn_norm.weight")
-      let ffnNorm = m.getTensor("blk." & $layer & ".ffn_norm.weight")
-      let wq = m.getTensor("blk." & $layer & ".attn_q.weight")
-      let wk = m.getTensor("blk." & $layer & ".attn_k.weight")
-      let wv = m.getTensor("blk." & $layer & ".attn_v.weight")
-      let wo = m.getTensor("blk." & $layer & ".attn_output.weight")
-      let wGate = m.getTensor("blk." & $layer & ".ffn_gate.weight")
-      let wUp = m.getTensor("blk." & $layer & ".ffn_up.weight")
-      let wDown = m.getTensor("blk." & $layer & ".ffn_down.weight")
+      when defined(profileHippo):
+        let gtStart = epochTime()
+      let lp = "blk." & $layer & "."
+      let dAttnNorm = cachedWeight(lp & "attn_norm.weight", m.getTensor(lp & "attn_norm.weight"))
+      let dFfnNorm = cachedWeight(lp & "ffn_norm.weight", m.getTensor(lp & "ffn_norm.weight"))
+      let dWq = cachedWeight(lp & "attn_q.weight", m.getTensor(lp & "attn_q.weight"))
+      let dWk = cachedWeight(lp & "attn_k.weight", m.getTensor(lp & "attn_k.weight"))
+      let dWv = cachedWeight(lp & "attn_v.weight", m.getTensor(lp & "attn_v.weight"))
+      let dWo = cachedWeight(lp & "attn_output.weight", m.getTensor(lp & "attn_output.weight"))
+      let dWGate = cachedWeight(lp & "ffn_gate.weight", m.getTensor(lp & "ffn_gate.weight"))
+      let dWUp = cachedWeight(lp & "ffn_up.weight", m.getTensor(lp & "ffn_up.weight"))
+      let dWDown = cachedWeight(lp & "ffn_down.weight", m.getTensor(lp & "ffn_down.weight"))
+      when defined(profileHippo):
+        getTensorMs += (epochTime() - gtStart) * 1000
+        cachedWeightMs = 0.0
 
-      let dAttnNorm = cachedWeight("blk." & $layer & ".attn_norm.weight", attnNorm)
-      let dFfnNorm = cachedWeight("blk." & $layer & ".ffn_norm.weight", ffnNorm)
-      let dWq = cachedWeight("blk." & $layer & ".attn_q.weight", wq)
-      let dWk = cachedWeight("blk." & $layer & ".attn_k.weight", wk)
-      let dWv = cachedWeight("blk." & $layer & ".attn_v.weight", wv)
-      let dWo = cachedWeight("blk." & $layer & ".attn_output.weight", wo)
-      let dWGate = cachedWeight("blk." & $layer & ".ffn_gate.weight", wGate)
-      let dWUp = cachedWeight("blk." & $layer & ".ffn_up.weight", wUp)
-      let dWDown = cachedWeight("blk." & $layer & ".ffn_down.weight", wDown)
-
+      when defined(profileHippo):
+        let klStart = epochTime()
       gpuRmsnormCols(xNormPtr, xPtr, dAttnNorm.devicePtr, hp.nEmb, 1, hp.rmsEps, stream)
       gpuLinearCol(tmp0, xNormPtr, dWq.devicePtr, hp.nEmb, hp.nEmb, 1, stream)
       gpuLinearCol(tmp1, xNormPtr, dWk.devicePtr, hp.nEmb, kvDim, 1, stream)
@@ -438,6 +442,8 @@ when defined(useHippo):
       gpuSiluMul(tmp2, tmp0, tmp1, hp.nFfn, stream)
       gpuLinearCol(tmp0, tmp2, dWDown.devicePtr, hp.nFfn, hp.nEmb, 1, stream)
       gpuAdd(xPtr, xPtr, tmp0, hp.nEmb, stream)
+      when defined(profileHippo):
+        kernelLaunchMs += (epochTime() - klStart) * 1000
 
     let norm = getTensorOr(m, "norm.weight", "output_norm.weight")
     let outW = outputWeightForLinear(m.getTensor("output.weight"), hp.nEmb, hp.nVocab)
@@ -447,10 +453,31 @@ when defined(useHippo):
     gpuRmsnormCols(xNormPtr, xPtr, dNorm.devicePtr, hp.nEmb, 1, hp.rmsEps, stream)
     gpuLinearCol(xPtr, xNormPtr, dOutW.devicePtr, outW.shape[0], outW.shape[1], 1, stream)
 
+    when defined(profileHippo):
+      hippoEventRecord(gpuEndEvt, stream)
+      let preSyncWall = epochTime()
+
     result = newTensor(@[outW.shape[1], 1])
     let bytes = result.data.len * sizeof(float32)
     gpuDownloadFromDevice(addr result.data[0], xPtr, bytes, stream)
     gpuStreamSync(stream)
+
+    when defined(profileHippo):
+      let wallEnd = epochTime()
+      hippoEventSynchronize(gpuEndEvt)
+      let gpuMs = hippoEventElapsedTime(gpuStartEvt, gpuEndEvt)
+      let totalMs = (wallEnd - wallStart) * 1000
+      let cpuMs = (preSyncWall - wallStart) * 1000
+      let syncMs = (wallEnd - preSyncWall) * 1000
+      echo "decode[pos=", pos, "]: total=", totalMs.formatFloat(ffDecimal, 1), "ms",
+           " cpu=", cpuMs.formatFloat(ffDecimal, 1), "ms",
+           " sync=", syncMs.formatFloat(ffDecimal, 1), "ms",
+           " gpu=", gpuMs.formatFloat(ffDecimal, 1), "ms"
+      echo "  getTensor=", getTensorMs.formatFloat(ffDecimal, 1), "ms",
+           " cachedWeight=", cachedWeightMs.formatFloat(ffDecimal, 1), "ms",
+           " kernelLaunch=", kernelLaunchMs.formatFloat(ffDecimal, 1), "ms"
+      hippoEventDestroy(gpuStartEvt)
+      hippoEventDestroy(gpuEndEvt)
 
     cache.curLen = pos + 1
     cache.gpuCache.curLen = cache.curLen

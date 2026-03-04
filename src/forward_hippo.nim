@@ -20,7 +20,11 @@ const
   HippoBlockSizeX = 16
   HippoBlockSizeY = 16
   HippoDecodeRowsPerBlock = 4
+  HippoDecodeDotUnroll = 4
   HippoMaxDecodeCols = 5632
+
+when HippoDecodeDotUnroll != 4:
+  {.error: "linearHippoDecodeKernel currently implements a fixed 4-way unroll.".}
 
 type
   HippoAllocRef* = type(hippoMalloc(1))
@@ -696,38 +700,76 @@ proc linearHippoDecodeKernel(
   var sx {.hippoShared.}: array[HippoMaxDecodeCols, float32]
   var sdata {.hippoShared.}: array[HippoBlockSize, float32]
   let tid = int(threadIdx.x)
+  let blockSize = int(blockDim.x)
+  let cols = int(wCols)
+  let unrollSpan = HippoDecodeDotUnroll * blockSize
   let baseRow = int(blockIdx.x) * HippoDecodeRowsPerBlock
   let wArray = cast[ptr UncheckedArray[float32]](wData)
   let xArray = cast[ptr UncheckedArray[float32]](xData)
   let outArray = cast[ptr UncheckedArray[float32]](outData)
 
   var k = tid
-  while k < int(wCols):
+  while k < cols:
     sx[k] = xArray[k]
-    k = k + int(blockDim.x)
+    k = k + blockSize
   hippoSyncthreads()
 
   for r in 0 ..< HippoDecodeRowsPerBlock:
     let outRow = baseRow + r
 
     if outRow < int(outRows):
-      let rowBase = outRow * int(wCols)
+      let rowBase = outRow * cols
       var acc = 0.0'f32
       k = tid
-      while k < int(wCols):
+      while k + (HippoDecodeDotUnroll - 1) * blockSize < cols:
+        let k1 = k + blockSize
+        let k2 = k1 + blockSize
+        let k3 = k2 + blockSize
         acc = acc + wArray[rowBase + k] * sx[k]
-        k = k + int(blockDim.x)
+        acc = acc + wArray[rowBase + k1] * sx[k1]
+        acc = acc + wArray[rowBase + k2] * sx[k2]
+        acc = acc + wArray[rowBase + k3] * sx[k3]
+        k = k + unrollSpan
+      while k < cols:
+        acc = acc + wArray[rowBase + k] * sx[k]
+        k = k + blockSize
       sdata[tid] = acc
     else:
       sdata[tid] = 0.0'f32
     hippoSyncthreads()
 
-    var stride = int(blockDim.x) div 2
-    while stride > 0:
-      if tid < stride:
-        sdata[tid] = sdata[tid] + sdata[tid + stride]
+    when HippoBlockSize == 256:
+      if tid < 128:
+        sdata[tid] = sdata[tid] + sdata[tid + 128]
       hippoSyncthreads()
-      stride = stride div 2
+      if tid < 64:
+        sdata[tid] = sdata[tid] + sdata[tid + 64]
+      hippoSyncthreads()
+      if tid < 32:
+        sdata[tid] = sdata[tid] + sdata[tid + 32]
+      hippoSyncthreads()
+      if tid < 16:
+        sdata[tid] = sdata[tid] + sdata[tid + 16]
+      hippoSyncthreads()
+      if tid < 8:
+        sdata[tid] = sdata[tid] + sdata[tid + 8]
+      hippoSyncthreads()
+      if tid < 4:
+        sdata[tid] = sdata[tid] + sdata[tid + 4]
+      hippoSyncthreads()
+      if tid < 2:
+        sdata[tid] = sdata[tid] + sdata[tid + 2]
+      hippoSyncthreads()
+      if tid < 1:
+        sdata[tid] = sdata[tid] + sdata[tid + 1]
+      hippoSyncthreads()
+    else:
+      var stride = blockSize div 2
+      while stride > 0:
+        if tid < stride:
+          sdata[tid] = sdata[tid] + sdata[tid + stride]
+        hippoSyncthreads()
+        stride = stride div 2
 
     if tid == 0 and outRow < int(outRows):
       outArray[outRow] = sdata[0]

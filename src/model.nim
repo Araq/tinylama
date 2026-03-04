@@ -113,11 +113,9 @@ proc loadModel*(path: string): Model =
 proc close*(m: var Model) =
   m.gguf.close()
 
-proc getTensor*(m: var Model, name: string): Tensor =
-  if m.cache.hasKey(name):
-    return m.cache[name]
-  if not m.infos.hasKey(name):
-    raise newException(KeyError, "missing tensor: " & name)
-  let t = loadTensorF32(m.gguf, m.infos[name])
-  m.cache[name] = t
-  t
+proc getTensor*(m: var Model, name: string): lent Tensor =
+  if not m.cache.hasKey(name):
+    if not m.infos.hasKey(name):
+      raise newException(KeyError, "missing tensor: " & name)
+    m.cache[name] = loadTensorF32(m.gguf, m.infos[name])
+  m.cache[name]
