@@ -684,22 +684,41 @@ proc linearHippoKernel(
     outArray[outRow * int(seqLen) + seqCol] = acc
 
 # ---------------------------------------------------------------------------
-# Kernel: Naive GEMV decode (one thread per output row)
-# Proven working — used as baseline
+# Kernel: Parallel GEMV decode (one block per output row)
+# Opt-1 implementation: many threads cooperate on each dot product
 # ---------------------------------------------------------------------------
 proc linearHippoDecodeKernel(
   wData, xData, outData: ptr float32,
   outRows, wCols: cint
 ) {.hippoGlobal.} =
-  let outRow = int(blockIdx.x * blockDim.x + threadIdx.x)
-  if outRow < int(outRows):
-    let wArray = cast[ptr UncheckedArray[float32]](wData)
-    let xArray = cast[ptr UncheckedArray[float32]](xData)
-    let outArray = cast[ptr UncheckedArray[float32]](outData)
-    var acc = 0.0'f32
-    for k in 0 ..< int(wCols):
-      acc = acc + wArray[outRow * int(wCols) + k] * xArray[k]
-    outArray[outRow] = acc
+  var sdata {.hippoShared.}: array[HippoBlockSize, float32]
+  let outRow = int(blockIdx.x)
+  let tid = int(threadIdx.x)
+  if outRow >= int(outRows):
+    return
+
+  let wArray = cast[ptr UncheckedArray[float32]](wData)
+  let xArray = cast[ptr UncheckedArray[float32]](xData)
+  let outArray = cast[ptr UncheckedArray[float32]](outData)
+  let rowBase = outRow * int(wCols)
+
+  var acc = 0.0'f32
+  var k = tid
+  while k < int(wCols):
+    acc = acc + wArray[rowBase + k] * xArray[k]
+    k = k + int(blockDim.x)
+  sdata[tid] = acc
+  hippoSyncthreads()
+
+  var stride = int(blockDim.x) div 2
+  while stride > 0:
+    if tid < stride:
+      sdata[tid] = sdata[tid] + sdata[tid + stride]
+    hippoSyncthreads()
+    stride = stride div 2
+
+  if tid == 0:
+    outArray[outRow] = sdata[0]
 
 # ---------------------------------------------------------------------------
 # Device GEMM dispatcher (operates on device pointers, no CPU roundtrip)
@@ -713,8 +732,8 @@ proc gpuLinearCol*(dst, x, w: pointer, wCols, wRows, seqLen: int,
   var wColsArg = wCols.cint
 
   if seqLen == 1:
-    # Naive GEMV: one thread per output row
-    let grid = newDim3(((wRows + HippoBlockSize - 1) div HippoBlockSize).uint32)
+    # Optimized decode path: one block per output row, parallel reduction.
+    let grid = newDim3(wRows.uint32)
     let blk = newDim3(HippoBlockSize.uint32)
     hippoLaunchKernel(linearHippoDecodeKernel, gridDim = grid, blockDim = blk,
                       stream = stream,
