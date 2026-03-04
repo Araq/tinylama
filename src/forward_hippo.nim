@@ -19,6 +19,8 @@ const
   HippoBlockSize = 256
   HippoBlockSizeX = 16
   HippoBlockSizeY = 16
+  HippoDecodeRowsPerBlock = 4
+  HippoMaxDecodeCols = 5632
 
 type
   HippoAllocRef* = type(hippoMalloc(1))
@@ -684,41 +686,52 @@ proc linearHippoKernel(
     outArray[outRow * int(seqLen) + seqCol] = acc
 
 # ---------------------------------------------------------------------------
-# Kernel: Parallel GEMV decode (one block per output row)
-# Opt-1 implementation: many threads cooperate on each dot product
+# Kernel: Multi-row GEMV decode with shared input vector
+# Opt-2 implementation: each block processes multiple rows
 # ---------------------------------------------------------------------------
 proc linearHippoDecodeKernel(
   wData, xData, outData: ptr float32,
   outRows, wCols: cint
 ) {.hippoGlobal.} =
+  var sx {.hippoShared.}: array[HippoMaxDecodeCols, float32]
   var sdata {.hippoShared.}: array[HippoBlockSize, float32]
-  let outRow = int(blockIdx.x)
   let tid = int(threadIdx.x)
-  if outRow >= int(outRows):
-    return
-
+  let baseRow = int(blockIdx.x) * HippoDecodeRowsPerBlock
   let wArray = cast[ptr UncheckedArray[float32]](wData)
   let xArray = cast[ptr UncheckedArray[float32]](xData)
   let outArray = cast[ptr UncheckedArray[float32]](outData)
-  let rowBase = outRow * int(wCols)
 
-  var acc = 0.0'f32
   var k = tid
   while k < int(wCols):
-    acc = acc + wArray[rowBase + k] * xArray[k]
+    sx[k] = xArray[k]
     k = k + int(blockDim.x)
-  sdata[tid] = acc
   hippoSyncthreads()
 
-  var stride = int(blockDim.x) div 2
-  while stride > 0:
-    if tid < stride:
-      sdata[tid] = sdata[tid] + sdata[tid + stride]
-    hippoSyncthreads()
-    stride = stride div 2
+  for r in 0 ..< HippoDecodeRowsPerBlock:
+    let outRow = baseRow + r
 
-  if tid == 0:
-    outArray[outRow] = sdata[0]
+    if outRow < int(outRows):
+      let rowBase = outRow * int(wCols)
+      var acc = 0.0'f32
+      k = tid
+      while k < int(wCols):
+        acc = acc + wArray[rowBase + k] * sx[k]
+        k = k + int(blockDim.x)
+      sdata[tid] = acc
+    else:
+      sdata[tid] = 0.0'f32
+    hippoSyncthreads()
+
+    var stride = int(blockDim.x) div 2
+    while stride > 0:
+      if tid < stride:
+        sdata[tid] = sdata[tid] + sdata[tid + stride]
+      hippoSyncthreads()
+      stride = stride div 2
+
+    if tid == 0 and outRow < int(outRows):
+      outArray[outRow] = sdata[0]
+    hippoSyncthreads()
 
 # ---------------------------------------------------------------------------
 # Device GEMM dispatcher (operates on device pointers, no CPU roundtrip)
@@ -732,8 +745,12 @@ proc gpuLinearCol*(dst, x, w: pointer, wCols, wRows, seqLen: int,
   var wColsArg = wCols.cint
 
   if seqLen == 1:
-    # Optimized decode path: one block per output row, parallel reduction.
-    let grid = newDim3(wRows.uint32)
+    if wCols > HippoMaxDecodeCols:
+      raise newException(ValueError,
+        "decode GEMV width exceeds HippoMaxDecodeCols: " & $wCols &
+        " > " & $HippoMaxDecodeCols)
+    # Optimized decode path: each block processes several output rows.
+    let grid = newDim3(((wRows + HippoDecodeRowsPerBlock - 1) div HippoDecodeRowsPerBlock).uint32)
     let blk = newDim3(HippoBlockSize.uint32)
     hippoLaunchKernel(linearHippoDecodeKernel, gridDim = grid, blockDim = blk,
                       stream = stream,
