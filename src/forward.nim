@@ -452,9 +452,19 @@ when defined(useHippo):
       when defined(profileHippo):
         recordStop(eventPairs, stream)
         recordStart(eventPairs, kcLinearQKV, stream)
-      gpuLinearCol(tmp0, xNormPtr, lw.wq, hp.nEmb, hp.nEmb, 1, stream)
-      gpuLinearCol(tmp1, xNormPtr, lw.wk, hp.nEmb, kvDim, 1, stream)
-      gpuLinearCol(tmp2, xNormPtr, lw.wv, hp.nEmb, kvDim, 1, stream)
+      # Q/K/V projections — dispatch quantized or float32
+      if lw.wqQ != nil:
+        gpuLinearColQuant(tmp0, xNormPtr, lw.wqQ, hp.nEmb, hp.nEmb, lw.wqQType, stream)
+      else:
+        gpuLinearCol(tmp0, xNormPtr, lw.wq, hp.nEmb, hp.nEmb, 1, stream)
+      if lw.wkQ != nil:
+        gpuLinearColQuant(tmp1, xNormPtr, lw.wkQ, hp.nEmb, kvDim, lw.wkQType, stream)
+      else:
+        gpuLinearCol(tmp1, xNormPtr, lw.wk, hp.nEmb, kvDim, 1, stream)
+      if lw.wvQ != nil:
+        gpuLinearColQuant(tmp2, xNormPtr, lw.wvQ, hp.nEmb, kvDim, lw.wvQType, stream)
+      else:
+        gpuLinearCol(tmp2, xNormPtr, lw.wv, hp.nEmb, kvDim, 1, stream)
       when defined(profileHippo):
         recordStop(eventPairs, stream)
         recordStart(eventPairs, kcRope, stream)
@@ -475,7 +485,10 @@ when defined(useHippo):
       when defined(profileHippo):
         recordStop(eventPairs, stream)
         recordStart(eventPairs, kcLinearO, stream)
-      gpuLinearCol(tmp0, xNormPtr, lw.wo, hp.nEmb, hp.nEmb, 1, stream)
+      if lw.woQ != nil:
+        gpuLinearColQuant(tmp0, xNormPtr, lw.woQ, hp.nEmb, hp.nEmb, lw.woQType, stream)
+      else:
+        gpuLinearCol(tmp0, xNormPtr, lw.wo, hp.nEmb, hp.nEmb, 1, stream)
       when defined(profileHippo):
         recordStop(eventPairs, stream)
         recordStart(eventPairs, kcResidualAttn, stream)
@@ -487,8 +500,14 @@ when defined(useHippo):
       when defined(profileHippo):
         recordStop(eventPairs, stream)
         recordStart(eventPairs, kcLinearGateUp, stream)
-      gpuLinearCol(tmp0, xNormPtr, lw.wGate, hp.nEmb, hp.nFfn, 1, stream)
-      gpuLinearCol(tmp1, xNormPtr, lw.wUp, hp.nEmb, hp.nFfn, 1, stream)
+      if lw.wGateQ != nil:
+        gpuLinearColQuant(tmp0, xNormPtr, lw.wGateQ, hp.nEmb, hp.nFfn, lw.wGateQType, stream)
+      else:
+        gpuLinearCol(tmp0, xNormPtr, lw.wGate, hp.nEmb, hp.nFfn, 1, stream)
+      if lw.wUpQ != nil:
+        gpuLinearColQuant(tmp1, xNormPtr, lw.wUpQ, hp.nEmb, hp.nFfn, lw.wUpQType, stream)
+      else:
+        gpuLinearCol(tmp1, xNormPtr, lw.wUp, hp.nEmb, hp.nFfn, 1, stream)
       when defined(profileHippo):
         recordStop(eventPairs, stream)
         recordStart(eventPairs, kcSiluMul, stream)
@@ -496,7 +515,10 @@ when defined(useHippo):
       when defined(profileHippo):
         recordStop(eventPairs, stream)
         recordStart(eventPairs, kcLinearDown, stream)
-      gpuLinearCol(tmp0, tmp2, lw.wDown, hp.nFfn, hp.nEmb, 1, stream)
+      if lw.wDownQ != nil:
+        gpuLinearColQuant(tmp0, tmp2, lw.wDownQ, hp.nFfn, hp.nEmb, lw.wDownQType, stream)
+      else:
+        gpuLinearCol(tmp0, tmp2, lw.wDown, hp.nFfn, hp.nEmb, 1, stream)
       when defined(profileHippo):
         recordStop(eventPairs, stream)
         recordStart(eventPairs, kcResidualFfn, stream)

@@ -8,11 +8,11 @@ import ./tensor
 import ./quant
 
 const
-  GGML_TYPE_F32 = 0
-  GGML_TYPE_F16 = 1
-  GGML_TYPE_Q2_K = 10
-  GGML_TYPE_Q3_K = 11
-  GGML_TYPE_Q6_K = 14
+  GGML_TYPE_F32* = 0
+  GGML_TYPE_F16* = 1
+  GGML_TYPE_Q2_K* = 10
+  GGML_TYPE_Q3_K* = 11
+  GGML_TYPE_Q6_K* = 14
 
 type
   HParams* = object
@@ -34,7 +34,7 @@ type
     infos*: Table[string, GgufTensorInfo]
     cache*: Table[string, Tensor]
 
-proc tensorElemCount(info: GgufTensorInfo): int =
+proc tensorElemCount*(info: GgufTensorInfo): int =
   var n = 1'u64
   for i in 0 ..< int(info.nDims):
     n *= info.ne[i]

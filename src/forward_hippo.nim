@@ -6,7 +6,9 @@
 import
   std/tables,
   ./tensor,
-  ./model
+  ./model,
+  ./gguf_loader,
+  ./quant
 
 when not defined(cpp):
   {.error: "useHippo requires Nim's C++ backend. Build with `nim cpp`.".}
@@ -112,9 +114,14 @@ proc gpuUploadInt32Pooled*(data: pointer, count: int, stream: HippoStream): poin
 # ---------------------------------------------------------------------------
 type
   LayerGpuPtrs* = object
-    attnNorm*, ffnNorm*: pointer
-    wq*, wk*, wv*, wo*: pointer
+    attnNorm*, ffnNorm*: pointer          # always float32 (small 1D tensors)
+    wq*, wk*, wv*, wo*: pointer            # float32 device pointers (nil if quantized)
     wGate*, wUp*, wDown*: pointer
+    wqQ*, wkQ*, wvQ*, woQ*: pointer        # quantized device pointers (nil if float32)
+    wGateQ*, wUpQ*, wDownQ*: pointer
+    wColsQ*, wColsDown*: int               # column counts for quant dispatch
+    wqQType*, wkQType*, wvQType*, woQType*: int32
+    wGateQType*, wUpQType*, wDownQType*: int32
 
   ModelGpuPtrs* = object
     layers*: seq[LayerGpuPtrs]
@@ -196,6 +203,305 @@ proc cachedWeight*(w: Tensor): GpuTensor =
   let gt = uploadToGpu(w, gpuCtx.stream)
   gt
 
+# ---------------------------------------------------------------------------
+# GpuQuantWeight — raw quantized bytes on GPU (no dequant to float32)
+# ---------------------------------------------------------------------------
+type
+  GpuQuantWeight* = object
+    devicePtr*: pointer
+    alloc: HippoAllocRef
+    sizeBytes*: int
+    nRows*: int
+    nCols*: int           # number of float elements per row
+
+var quantWeightCache: Table[string, GpuQuantWeight]
+
+proc cachedQuantWeight*(name: string, m: var Model, tensorName: string): GpuQuantWeight =
+  if quantWeightCache.hasKey(name):
+    return quantWeightCache[name]
+  ensureGpuContext()
+  let info = m.infos[tensorName]
+  let dataPtr = tensorDataPtr(m.gguf, info)
+  let nCols = int(info.ne[0])
+  let nRows = tensorElemCount(info) div nCols
+  let rowSize = case info.elemType
+    of GGML_TYPE_Q2_K: rowSizeQ2K(nCols)
+    of GGML_TYPE_Q3_K: rowSizeQ3K(nCols)
+    of GGML_TYPE_Q6_K: rowSizeQ6K(nCols)
+    else: raise newException(ValueError, "unsupported quant type for GPU upload: " & $info.elemType)
+  let totalBytes = rowSize * nRows
+  let alloc = hippoMalloc(totalBytes)
+  hippoMemcpyAsync(alloc.p, dataPtr, totalBytes, HippoMemcpyHostToDevice, gpuCtx.stream)
+  result = GpuQuantWeight(devicePtr: alloc.p, alloc: alloc, sizeBytes: totalBytes,
+                          nRows: nRows, nCols: nCols)
+  quantWeightCache[name] = result
+
+
+# ---------------------------------------------------------------------------
+# Kernel: Q2_K GEMV decode — reads raw quantized bytes, dequants on the fly
+# ---------------------------------------------------------------------------
+proc linearQ2KDecodeKernel(
+  wData: ptr uint8,          # raw Q2_K bytes
+  xData, outData: ptr float32,
+  outRows, wCols: cint
+) {.hippoGlobal.} =
+  var sx {.hippoShared.}: array[HippoMaxDecodeCols, float32]
+  var sdata {.hippoShared.}: array[HippoBlockSize, float32]
+  let tid = int(threadIdx.x)
+  let blockSize = int(blockDim.x)
+  let cols = int(wCols)
+  let baseRow = int(blockIdx.x) * HippoDecodeRowsPerBlock
+  let w = cast[ptr UncheckedArray[uint8]](wData)
+  let xArr = cast[ptr UncheckedArray[float32]](xData)
+  let outArr = cast[ptr UncheckedArray[float32]](outData)
+  let nBlocksPerRow = cols div 256
+  let rowSizeBytes = nBlocksPerRow * 84
+
+  # Load input vector into shared memory
+  var k = tid
+  while k < cols:
+    sx[k] = xArr[k]
+    k = k + blockSize
+  hippoSyncthreads()
+
+  # Pre-compute element mapping — constant across all blocks and rows
+  let q2_chunk = tid shr 7
+  let q2_localElem = tid and 127
+  let q2_iteration = q2_localElem shr 5
+  let q2_sub = (q2_localElem shr 4) and 1
+  let q2_l = q2_localElem and 15
+  let q2_scaleIdx = q2_chunk * 8 + q2_iteration * 2 + q2_sub
+  let q2_shift = q2_iteration * 2
+  let q2_qsByteIdx = q2_chunk * 32 + q2_sub * 16 + q2_l
+
+  for r in 0 ..< HippoDecodeRowsPerBlock:
+    let outRow = baseRow + r
+    if outRow < int(outRows):
+      let rowBase = outRow * rowSizeBytes
+      var acc = 0.0'f32
+
+      var blkIdx = 0
+      while blkIdx < nBlocksPerRow:
+        let blkStart = rowBase + blkIdx * 84
+        let elemBase = blkIdx * 256
+
+        let dRaw = uint16(w[blkStart + 80]) or (uint16(w[blkStart + 81]) shl 8)
+        let dminRaw = uint16(w[blkStart + 82]) or (uint16(w[blkStart + 83]) shl 8)
+        let d = hippoHalfToFloat(dRaw)
+        let dmin = hippoHalfToFloat(dminRaw)
+
+        let sc = w[blkStart + q2_scaleIdx]
+        let dl = d * cfloat(sc and 0x0F'u8)
+        let ml = dmin * cfloat(sc shr 4)
+        let qval = cfloat((w[blkStart + 16 + q2_qsByteIdx] shr q2_shift) and 3)
+
+        acc = acc + (dl * qval - ml) * sx[elemBase + tid]
+        blkIdx = blkIdx + 1
+
+      sdata[tid] = acc
+    else:
+      sdata[tid] = 0.0'f32
+    hippoSyncthreads()
+
+    # 256-thread tree reduction (same as float32 kernel)
+    when HippoBlockSize == 256:
+      if tid < 128:
+        sdata[tid] = sdata[tid] + sdata[tid + 128]
+      hippoSyncthreads()
+      if tid < 64:
+        sdata[tid] = sdata[tid] + sdata[tid + 64]
+      hippoSyncthreads()
+      if tid < 32:
+        sdata[tid] = sdata[tid] + sdata[tid + 32]
+      hippoSyncthreads()
+      if tid < 16:
+        sdata[tid] = sdata[tid] + sdata[tid + 16]
+      hippoSyncthreads()
+      if tid < 8:
+        sdata[tid] = sdata[tid] + sdata[tid + 8]
+      hippoSyncthreads()
+      if tid < 4:
+        sdata[tid] = sdata[tid] + sdata[tid + 4]
+      hippoSyncthreads()
+      if tid < 2:
+        sdata[tid] = sdata[tid] + sdata[tid + 2]
+      hippoSyncthreads()
+      if tid < 1:
+        sdata[tid] = sdata[tid] + sdata[tid + 1]
+      hippoSyncthreads()
+    else:
+      var stride = blockSize div 2
+      while stride > 0:
+        if tid < stride:
+          sdata[tid] = sdata[tid] + sdata[tid + stride]
+        hippoSyncthreads()
+        stride = stride div 2
+
+    if tid == 0 and outRow < int(outRows):
+      outArr[outRow] = sdata[0]
+    hippoSyncthreads()
+
+proc gpuLinearColQ2K*(dst, x, wQuant: pointer, wCols, wRows: int,
+                       stream: HippoStream) =
+  if wCols > HippoMaxDecodeCols:
+    raise newException(ValueError, "Q2K decode width exceeds limit: " & $wCols)
+  let grid = newDim3(((wRows + HippoDecodeRowsPerBlock - 1) div HippoDecodeRowsPerBlock).uint32)
+  let blk = newDim3(HippoBlockSize.uint32)
+  var wPtr = wQuant; var xPtr = x; var dPtr = dst
+  var outRowsArg = wRows.cint; var wColsArg = wCols.cint
+  hippoLaunchKernel(linearQ2KDecodeKernel, gridDim = grid, blockDim = blk,
+                    stream = stream,
+                    args = hippoArgs(wPtr, xPtr, dPtr, outRowsArg, wColsArg))
+
+# ---------------------------------------------------------------------------
+# Kernel: Q3_K GEMV decode — reads raw quantized bytes, dequants on the fly
+# ---------------------------------------------------------------------------
+# Q3_K block layout (110 bytes → 256 float32 elements):
+#   hmask[32]   @ offset 0   — 1 high-bit per element (256 bits)
+#   qs[64]      @ offset 32  — 2 low bits per element, 4 packed per byte
+#   scales[12]  @ offset 96  — packed scale bytes (decoded into 16 x int8)
+#   d           @ offset 108 — float16 block scale
+proc linearQ3KDecodeKernel(
+  wData: ptr uint8,
+  xData, outData: ptr float32,
+  outRows, wCols: cint
+) {.hippoGlobal.} =
+  var sx {.hippoShared.}: array[HippoMaxDecodeCols, float32]
+  var sdata {.hippoShared.}: array[HippoBlockSize, float32]
+  let tid = int(threadIdx.x)
+  let blockSize = int(blockDim.x)
+  let cols = int(wCols)
+  let baseRow = int(blockIdx.x) * HippoDecodeRowsPerBlock
+  let w = cast[ptr UncheckedArray[uint8]](wData)
+  let xArr = cast[ptr UncheckedArray[float32]](xData)
+  let outArr = cast[ptr UncheckedArray[float32]](outData)
+  let nBlocksPerRow = cols div 256
+  let rowSizeBytes = nBlocksPerRow * 110  # blockQ3KSize = 110
+
+  # Load input vector into shared memory
+  var k = tid
+  while k < cols:
+    sx[k] = xArr[k]
+    k = k + blockSize
+  hippoSyncthreads()
+
+  # Pre-compute element mapping — constant across all blocks and rows
+  let chunk = tid shr 7              # 0 or 1
+  let localElem = tid and 127
+  let iteration = localElem shr 5    # 0-3
+  let sub = (localElem shr 4) and 1  # 0 or 1
+  let l = localElem and 15           # 0-15
+  let scaleIdx = chunk * 8 + iteration * 2 + sub
+  let shift = iteration * 2
+  let qsByteIdx = chunk * 32 + sub * 16 + l
+  let hmaskByteOff = qsByteIdx mod 32  # = sub*16 + l
+  let hmaskBitPos = chunk * 4 + iteration
+  # Scale extraction offsets
+  let byteInGroup = scaleIdx and 3
+  let auxIdx = scaleIdx shr 2
+  let sByteOff = 96 + (auxIdx and 1) * 4 + byteInGroup
+  let tByteOff = 96 + 8 + byteInGroup
+  let useHighShift = (auxIdx shr 1) * 4
+  let auxShift = auxIdx * 2
+
+  for r in 0 ..< HippoDecodeRowsPerBlock:
+    let outRow = baseRow + r
+    if outRow < int(outRows):
+      let rowBase = outRow * rowSizeBytes
+      var acc = 0.0'f32
+
+      var blkIdx = 0
+      while blkIdx < nBlocksPerRow:
+        let blkStart = rowBase + blkIdx * 110
+        let elemBase = blkIdx * 256
+
+        # Read d (float16) from offset 108
+        let dRaw = uint16(w[blkStart + 108]) or (uint16(w[blkStart + 109]) shl 8)
+        let dAll = hippoHalfToFloat(dRaw)
+
+        # Extract scale: read 2 bytes, compute low/high nibbles
+        let sByte = cint(w[blkStart + sByteOff])
+        let tByte = cint(w[blkStart + tByteOff])
+        let low = (sByte shr useHighShift) and 0x0F
+        let high = ((tByte shr auxShift) and 0x03) shl 4
+        let scaleByte = low or high
+        # Branchless sign extension: (x ^ 0x80) - 0x80
+        let scaleSigned = ((scaleByte xor 0x80) - 0x80)
+        let dl = dAll * cfloat(scaleSigned - 32)
+
+        # Extract 2-bit qval from qs (offset 32 in block)
+        let qval = cint((w[blkStart + 32 + qsByteIdx] shr shift) and 3)
+
+        # Extract hmask bit branchlessly: 4 when bit=0, 0 when bit=1
+        let hmBit = (cint(w[blkStart + hmaskByteOff]) shr hmaskBitPos) and 1
+        let hm = 4 - hmBit * 4
+
+        acc = acc + dl * cfloat(qval - hm) * sx[elemBase + tid]
+        blkIdx = blkIdx + 1
+
+      sdata[tid] = acc
+    else:
+      sdata[tid] = 0.0'f32
+    hippoSyncthreads()
+
+    # 256-thread tree reduction
+    when HippoBlockSize == 256:
+      if tid < 128:
+        sdata[tid] = sdata[tid] + sdata[tid + 128]
+      hippoSyncthreads()
+      if tid < 64:
+        sdata[tid] = sdata[tid] + sdata[tid + 64]
+      hippoSyncthreads()
+      if tid < 32:
+        sdata[tid] = sdata[tid] + sdata[tid + 32]
+      hippoSyncthreads()
+      if tid < 16:
+        sdata[tid] = sdata[tid] + sdata[tid + 16]
+      hippoSyncthreads()
+      if tid < 8:
+        sdata[tid] = sdata[tid] + sdata[tid + 8]
+      hippoSyncthreads()
+      if tid < 4:
+        sdata[tid] = sdata[tid] + sdata[tid + 4]
+      hippoSyncthreads()
+      if tid < 2:
+        sdata[tid] = sdata[tid] + sdata[tid + 2]
+      hippoSyncthreads()
+      if tid < 1:
+        sdata[tid] = sdata[tid] + sdata[tid + 1]
+      hippoSyncthreads()
+    else:
+      var stride = blockSize div 2
+      while stride > 0:
+        if tid < stride:
+          sdata[tid] = sdata[tid] + sdata[tid + stride]
+        hippoSyncthreads()
+        stride = stride div 2
+
+    if tid == 0 and outRow < int(outRows):
+      outArr[outRow] = sdata[0]
+    hippoSyncthreads()
+
+proc gpuLinearColQ3K*(dst, x, wQuant: pointer, wCols, wRows: int,
+                       stream: HippoStream) =
+  if wCols > HippoMaxDecodeCols:
+    raise newException(ValueError, "Q3K decode width exceeds limit: " & $wCols)
+  let grid = newDim3(((wRows + HippoDecodeRowsPerBlock - 1) div HippoDecodeRowsPerBlock).uint32)
+  let blk = newDim3(HippoBlockSize.uint32)
+  var wPtr = wQuant; var xPtr = x; var dPtr = dst
+  var outRowsArg = wRows.cint; var wColsArg = wCols.cint
+  hippoLaunchKernel(linearQ3KDecodeKernel, gridDim = grid, blockDim = blk,
+                    stream = stream,
+                    args = hippoArgs(wPtr, xPtr, dPtr, outRowsArg, wColsArg))
+
+proc gpuLinearColQuant*(dst, x, wQuant: pointer, wCols, wRows: int,
+                         quantType: int32, stream: HippoStream) =
+  ## Dispatch to the appropriate quantized GEMV kernel based on quant type.
+  case quantType
+  of GGML_TYPE_Q2_K: gpuLinearColQ2K(dst, x, wQuant, wCols, wRows, stream)
+  of GGML_TYPE_Q3_K: gpuLinearColQ3K(dst, x, wQuant, wCols, wRows, stream)
+  else: raise newException(ValueError, "unsupported quant type for GPU GEMV: " & $quantType)
+
 proc ensureModelGpuPtrs*(m: var Model, hp: HParams) =
   ## Populate modelPtrs once by caching all weight device pointers.
   if modelPtrs.initialized:
@@ -210,20 +516,42 @@ proc ensureModelGpuPtrs*(m: var Model, hp: HParams) =
     tokEmb = m.getTensor("tok_embeddings.weight")
   modelPtrs.tokEmb = cachedWeight("token_embd_or_tok_embeddings", tokEmb).devicePtr
 
-  # Per-layer weights
+  # Per-layer weights — use Q2_K raw upload when available, else float32
   modelPtrs.layers = newSeq[LayerGpuPtrs](hp.nLayer)
   for layer in 0 ..< hp.nLayer:
     let lp = "blk." & $layer & "."
     var lw: LayerGpuPtrs
+
+    # Norms are always small float32 tensors
     lw.attnNorm = cachedWeight(lp & "attn_norm.weight", m.getTensor(lp & "attn_norm.weight")).devicePtr
     lw.ffnNorm = cachedWeight(lp & "ffn_norm.weight", m.getTensor(lp & "ffn_norm.weight")).devicePtr
-    lw.wq = cachedWeight(lp & "attn_q.weight", m.getTensor(lp & "attn_q.weight")).devicePtr
-    lw.wk = cachedWeight(lp & "attn_k.weight", m.getTensor(lp & "attn_k.weight")).devicePtr
-    lw.wv = cachedWeight(lp & "attn_v.weight", m.getTensor(lp & "attn_v.weight")).devicePtr
-    lw.wo = cachedWeight(lp & "attn_output.weight", m.getTensor(lp & "attn_output.weight")).devicePtr
-    lw.wGate = cachedWeight(lp & "ffn_gate.weight", m.getTensor(lp & "ffn_gate.weight")).devicePtr
-    lw.wUp = cachedWeight(lp & "ffn_up.weight", m.getTensor(lp & "ffn_up.weight")).devicePtr
-    lw.wDown = cachedWeight(lp & "ffn_down.weight", m.getTensor(lp & "ffn_down.weight")).devicePtr
+
+    # Helper to upload a weight: quantized raw bytes or dequantized float32
+    template uploadWeight(fp32Field, quantField, qtypeField: untyped, tensorSuffix: string) =
+      let tn = lp & tensorSuffix
+      let et = m.infos[tn].elemType.int32
+      if et in {GGML_TYPE_Q2_K.int32, GGML_TYPE_Q3_K.int32}:
+        let qw = cachedQuantWeight(tn, m, tn)
+        quantField = qw.devicePtr
+        fp32Field = nil
+        qtypeField = et
+      else:
+        fp32Field = cachedWeight(tn, m.getTensor(tn)).devicePtr
+        quantField = nil
+        qtypeField = 0
+
+    uploadWeight(lw.wq, lw.wqQ, lw.wqQType, "attn_q.weight")
+    uploadWeight(lw.wk, lw.wkQ, lw.wkQType, "attn_k.weight")
+    uploadWeight(lw.wv, lw.wvQ, lw.wvQType, "attn_v.weight")
+    uploadWeight(lw.wo, lw.woQ, lw.woQType, "attn_output.weight")
+    uploadWeight(lw.wGate, lw.wGateQ, lw.wGateQType, "ffn_gate.weight")
+    uploadWeight(lw.wUp, lw.wUpQ, lw.wUpQType, "ffn_up.weight")
+    uploadWeight(lw.wDown, lw.wDownQ, lw.wDownQType, "ffn_down.weight")
+
+    # Store column counts needed for quant dispatch
+    lw.wColsQ = hp.nEmb
+    lw.wColsDown = hp.nFfn
+
     modelPtrs.layers[layer] = lw
 
   # Final norm + output
