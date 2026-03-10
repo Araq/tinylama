@@ -5,7 +5,8 @@
 
 import
   std/tables,
-  ./tensor
+  ./tensor,
+  ./model
 
 when not defined(cpp):
   {.error: "useHippo requires Nim's C++ backend. Build with `nim cpp`.".}
@@ -94,6 +95,36 @@ proc gpuAllocAndUploadInt32*(data: pointer, count: int, stream: HippoStream): po
   hippoMemcpyAsync(tokenAllocKeepAlive.p, data, bytes, HippoMemcpyHostToDevice, stream)
   tokenAllocKeepAlive.p
 
+var tokenBufAlloc: HippoAllocRef
+var tokenBufCapacity: int = 0
+
+proc gpuUploadInt32Pooled*(data: pointer, count: int, stream: HippoStream): pointer =
+  ## Upload int32 data to a reusable GPU buffer (no hipMalloc per call).
+  let bytes = count * sizeof(int32)
+  if bytes > tokenBufCapacity:
+    tokenBufAlloc = hippoMalloc(max(bytes, 16))
+    tokenBufCapacity = max(bytes, 16)
+  hippoMemcpyAsync(tokenBufAlloc.p, data, bytes, HippoMemcpyHostToDevice, stream)
+  tokenBufAlloc.p
+
+# ---------------------------------------------------------------------------
+# Pre-computed layer GPU pointers — zero string ops / table lookups in hot loop
+# ---------------------------------------------------------------------------
+type
+  LayerGpuPtrs* = object
+    attnNorm*, ffnNorm*: pointer
+    wq*, wk*, wv*, wo*: pointer
+    wGate*, wUp*, wDown*: pointer
+
+  ModelGpuPtrs* = object
+    layers*: seq[LayerGpuPtrs]
+    tokEmb*: pointer
+    normWeight*, outputWeight*: pointer
+    outputShape0*, outputShape1*: int
+    initialized*: bool
+
+var modelPtrs*: ModelGpuPtrs
+
 proc gpuUploadToDevice*(dst: pointer, src: pointer, bytes: int, stream: HippoStream) =
   ## Upload host data to existing device pointer.
   hippoMemcpyAsync(dst, src, bytes, HippoMemcpyHostToDevice, stream)
@@ -164,6 +195,62 @@ proc cachedWeight*(w: Tensor): GpuTensor =
   ensureGpuContext()
   let gt = uploadToGpu(w, gpuCtx.stream)
   gt
+
+proc ensureModelGpuPtrs*(m: var Model, hp: HParams) =
+  ## Populate modelPtrs once by caching all weight device pointers.
+  if modelPtrs.initialized:
+    return
+  ensureGpuContext()
+
+  # Token embedding
+  var tokEmb: Tensor
+  try:
+    tokEmb = m.getTensor("token_embd.weight")
+  except KeyError:
+    tokEmb = m.getTensor("tok_embeddings.weight")
+  modelPtrs.tokEmb = cachedWeight("token_embd_or_tok_embeddings", tokEmb).devicePtr
+
+  # Per-layer weights
+  modelPtrs.layers = newSeq[LayerGpuPtrs](hp.nLayer)
+  for layer in 0 ..< hp.nLayer:
+    let lp = "blk." & $layer & "."
+    var lw: LayerGpuPtrs
+    lw.attnNorm = cachedWeight(lp & "attn_norm.weight", m.getTensor(lp & "attn_norm.weight")).devicePtr
+    lw.ffnNorm = cachedWeight(lp & "ffn_norm.weight", m.getTensor(lp & "ffn_norm.weight")).devicePtr
+    lw.wq = cachedWeight(lp & "attn_q.weight", m.getTensor(lp & "attn_q.weight")).devicePtr
+    lw.wk = cachedWeight(lp & "attn_k.weight", m.getTensor(lp & "attn_k.weight")).devicePtr
+    lw.wv = cachedWeight(lp & "attn_v.weight", m.getTensor(lp & "attn_v.weight")).devicePtr
+    lw.wo = cachedWeight(lp & "attn_output.weight", m.getTensor(lp & "attn_output.weight")).devicePtr
+    lw.wGate = cachedWeight(lp & "ffn_gate.weight", m.getTensor(lp & "ffn_gate.weight")).devicePtr
+    lw.wUp = cachedWeight(lp & "ffn_up.weight", m.getTensor(lp & "ffn_up.weight")).devicePtr
+    lw.wDown = cachedWeight(lp & "ffn_down.weight", m.getTensor(lp & "ffn_down.weight")).devicePtr
+    modelPtrs.layers[layer] = lw
+
+  # Final norm + output
+  var norm: Tensor
+  try:
+    norm = m.getTensor("output_norm.weight")
+  except KeyError:
+    norm = m.getTensor("norm.weight")
+  modelPtrs.normWeight = cachedWeight("norm_or_output_norm.weight", norm).devicePtr
+
+  # Output weight — handle both orientations
+  let outW = m.getTensor("output.weight")
+  let a0 = outW.shape[0]
+  let a1 = outW.shape[1]
+  if a0 == hp.nEmb and a1 == hp.nVocab:
+    modelPtrs.outputWeight = cachedWeight("output.weight", outW).devicePtr
+    modelPtrs.outputShape0 = a0
+    modelPtrs.outputShape1 = a1
+  elif a0 == hp.nVocab and a1 == hp.nEmb:
+    let reshaped = outW.reshape(@[a1, a0])
+    modelPtrs.outputWeight = cachedWeight("output.weight", reshaped).devicePtr
+    modelPtrs.outputShape0 = a1
+    modelPtrs.outputShape1 = a0
+  else:
+    raise newException(ValueError, "output weight shape mismatch")
+
+  modelPtrs.initialized = true
 
 # ---------------------------------------------------------------------------
 # GPU KV Cache

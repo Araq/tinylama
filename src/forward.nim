@@ -8,6 +8,45 @@ when defined(profileHippo):
   import std/[times, strutils]
   import hippo
 
+  type
+    KernelCategory* = enum
+      kcEmbedding, kcRmsNormAttn, kcLinearQKV, kcRope, kcKvStore,
+      kcAttention, kcLinearO, kcResidualAttn, kcRmsNormFfn,
+      kcLinearGateUp, kcSiluMul, kcLinearDown, kcResidualFfn,
+      kcFinalNormOutput
+
+    EventPair* = object
+      start*: HippoEvent
+      stop*: HippoEvent
+      cat*: KernelCategory
+
+  proc recordStart(pairs: var seq[EventPair], cat: KernelCategory, stream: HippoStream) =
+    var ep: EventPair
+    ep.cat = cat
+    ep.start = hippoEventCreate()
+    hippoEventRecord(ep.start, stream)
+    pairs.add(ep)
+
+  proc recordStop(pairs: var seq[EventPair], stream: HippoStream) =
+    pairs[^1].stop = hippoEventCreate()
+    hippoEventRecord(pairs[^1].stop, stream)
+
+  proc printBreakdown(pairs: seq[EventPair]) =
+    var catMs: array[KernelCategory, float32]
+    var totalMs: float32 = 0
+    for ep in pairs:
+      let ms = hippoEventElapsedTime(ep.start, ep.stop)
+      catMs[ep.cat] += ms
+      totalMs += ms
+      hippoEventDestroy(ep.start)
+      hippoEventDestroy(ep.stop)
+    echo "  GPU kernel breakdown (total=", totalMs.formatFloat(ffDecimal, 2), "ms):"
+    for cat in KernelCategory:
+      if catMs[cat] > 0:
+        let pct = if totalMs > 0: catMs[cat] / totalMs * 100 else: 0.0
+        echo "    ", ($cat).alignLeft(20), catMs[cat].formatFloat(ffDecimal, 3), " ms  ",
+             pct.formatFloat(ffDecimal, 1), "%"
+
 when defined(useHippo) and defined(useMalebolgia):
   {.error: "useHippo and useMalebolgia are mutually exclusive. Choose one backend.".}
 
@@ -294,7 +333,7 @@ when defined(useHippo):
 
     let tokEmb = getTensorOr(m, "tok_embeddings.weight", "token_embd.weight")
     let dTokEmb = cachedWeight("token_embd_or_tok_embeddings", tokEmb)
-    let tokenPtr = gpuAllocAndUploadInt32(unsafeAddr tokens[0], seqLen, stream)
+    let tokenPtr = gpuUploadInt32Pooled(unsafeAddr tokens[0], seqLen, stream)
 
     var xPtr = gpuCtx.act0.devicePtr
     let xNormPtr = gpuCtx.act1.devicePtr
@@ -375,16 +414,17 @@ when defined(useHippo):
     ensureScratchBuffers(maxRows)
     let stream = gpuCtx.stream
 
+    ensureModelGpuPtrs(m, hp)
+
     when defined(profileHippo):
       let wallStart = epochTime()
       let gpuStartEvt = hippoEventCreate()
       let gpuEndEvt = hippoEventCreate()
       hippoEventRecord(gpuStartEvt, stream)
+      var eventPairs: seq[EventPair]
 
-    let tokEmb = getTensorOr(m, "tok_embeddings.weight", "token_embd.weight")
-    let dTokEmb = cachedWeight("token_embd_or_tok_embeddings", tokEmb)
     var tok = token
-    let tokenPtr = gpuAllocAndUploadInt32(unsafeAddr tok, 1, stream)
+    let tokenPtr = gpuUploadInt32Pooled(unsafeAddr tok, 1, stream)
 
     var xPtr = gpuCtx.act0.devicePtr
     let xNormPtr = gpuCtx.act1.devicePtr
@@ -392,72 +432,91 @@ when defined(useHippo):
     let tmp1 = gpuCtx.scratch1.devicePtr
     let tmp2 = gpuCtx.scratch2.devicePtr
 
-    gpuEmbedding(xPtr, dTokEmb.devicePtr, cast[ptr int32](tokenPtr),
+    when defined(profileHippo):
+      recordStart(eventPairs, kcEmbedding, stream)
+    gpuEmbedding(xPtr, modelPtrs.tokEmb, cast[ptr int32](tokenPtr),
                  hp.nEmb, 1, hp.nVocab, stream)
+    when defined(profileHippo):
+      recordStop(eventPairs, stream)
 
     when defined(profileHippo):
-      var getTensorMs = 0.0
-      var cachedWeightMs = 0.0
       var kernelLaunchMs = 0.0
 
     for layer in 0 ..< hp.nLayer:
-      when defined(profileHippo):
-        let gtStart = epochTime()
-      let lp = "blk." & $layer & "."
-      let dAttnNorm = cachedWeight(lp & "attn_norm.weight", m.getTensor(lp & "attn_norm.weight"))
-      let dFfnNorm = cachedWeight(lp & "ffn_norm.weight", m.getTensor(lp & "ffn_norm.weight"))
-      let dWq = cachedWeight(lp & "attn_q.weight", m.getTensor(lp & "attn_q.weight"))
-      let dWk = cachedWeight(lp & "attn_k.weight", m.getTensor(lp & "attn_k.weight"))
-      let dWv = cachedWeight(lp & "attn_v.weight", m.getTensor(lp & "attn_v.weight"))
-      let dWo = cachedWeight(lp & "attn_output.weight", m.getTensor(lp & "attn_output.weight"))
-      let dWGate = cachedWeight(lp & "ffn_gate.weight", m.getTensor(lp & "ffn_gate.weight"))
-      let dWUp = cachedWeight(lp & "ffn_up.weight", m.getTensor(lp & "ffn_up.weight"))
-      let dWDown = cachedWeight(lp & "ffn_down.weight", m.getTensor(lp & "ffn_down.weight"))
-      when defined(profileHippo):
-        getTensorMs += (epochTime() - gtStart) * 1000
-        cachedWeightMs = 0.0
+      let lw = modelPtrs.layers[layer]
 
       when defined(profileHippo):
         let klStart = epochTime()
-      gpuRmsnormCols(xNormPtr, xPtr, dAttnNorm.devicePtr, hp.nEmb, 1, hp.rmsEps, stream)
-      gpuLinearCol(tmp0, xNormPtr, dWq.devicePtr, hp.nEmb, hp.nEmb, 1, stream)
-      gpuLinearCol(tmp1, xNormPtr, dWk.devicePtr, hp.nEmb, kvDim, 1, stream)
-      gpuLinearCol(tmp2, xNormPtr, dWv.devicePtr, hp.nEmb, kvDim, 1, stream)
+        recordStart(eventPairs, kcRmsNormAttn, stream)
+      gpuRmsnormCols(xNormPtr, xPtr, lw.attnNorm, hp.nEmb, 1, hp.rmsEps, stream)
+      when defined(profileHippo):
+        recordStop(eventPairs, stream)
+        recordStart(eventPairs, kcLinearQKV, stream)
+      gpuLinearCol(tmp0, xNormPtr, lw.wq, hp.nEmb, hp.nEmb, 1, stream)
+      gpuLinearCol(tmp1, xNormPtr, lw.wk, hp.nEmb, kvDim, 1, stream)
+      gpuLinearCol(tmp2, xNormPtr, lw.wv, hp.nEmb, kvDim, 1, stream)
+      when defined(profileHippo):
+        recordStop(eventPairs, stream)
+        recordStart(eventPairs, kcRope, stream)
       gpuRopeAtPos(tmp0, hp.nHead, headDim, ropeDim, hp.ropeFreqBase, pos, 1, stream)
       gpuRopeAtPos(tmp1, hp.nHeadKv, headDim, ropeDim, hp.ropeFreqBase, pos, 1, stream)
-
+      when defined(profileHippo):
+        recordStop(eventPairs, stream)
+        recordStart(eventPairs, kcKvStore, stream)
       gpuStoreKV(cache.gpuCache.k[layer].devicePtr, tmp1, kvDim, 1, cache.gpuCache.maxLen, pos, stream)
       gpuStoreKV(cache.gpuCache.v[layer].devicePtr, tmp2, kvDim, 1, cache.gpuCache.maxLen, pos, stream)
-
+      when defined(profileHippo):
+        recordStop(eventPairs, stream)
+        recordStart(eventPairs, kcAttention, stream)
       gpuAttentionDecode(xNormPtr, tmp0, cache.gpuCache.k[layer].devicePtr,
                          cache.gpuCache.v[layer].devicePtr,
                          hp.nHead, hp.nHeadKv, headDim, pos + 1,
                          cache.gpuCache.maxLen, stream)
-      gpuLinearCol(tmp0, xNormPtr, dWo.devicePtr, hp.nEmb, hp.nEmb, 1, stream)
-      gpuAdd(xPtr, xPtr, tmp0, hp.nEmb, stream)
-
-      gpuRmsnormCols(xNormPtr, xPtr, dFfnNorm.devicePtr, hp.nEmb, 1, hp.rmsEps, stream)
-      gpuLinearCol(tmp0, xNormPtr, dWGate.devicePtr, hp.nEmb, hp.nFfn, 1, stream)
-      gpuLinearCol(tmp1, xNormPtr, dWUp.devicePtr, hp.nEmb, hp.nFfn, 1, stream)
-      gpuSiluMul(tmp2, tmp0, tmp1, hp.nFfn, stream)
-      gpuLinearCol(tmp0, tmp2, dWDown.devicePtr, hp.nFfn, hp.nEmb, 1, stream)
+      when defined(profileHippo):
+        recordStop(eventPairs, stream)
+        recordStart(eventPairs, kcLinearO, stream)
+      gpuLinearCol(tmp0, xNormPtr, lw.wo, hp.nEmb, hp.nEmb, 1, stream)
+      when defined(profileHippo):
+        recordStop(eventPairs, stream)
+        recordStart(eventPairs, kcResidualAttn, stream)
       gpuAdd(xPtr, xPtr, tmp0, hp.nEmb, stream)
       when defined(profileHippo):
+        recordStop(eventPairs, stream)
+        recordStart(eventPairs, kcRmsNormFfn, stream)
+      gpuRmsnormCols(xNormPtr, xPtr, lw.ffnNorm, hp.nEmb, 1, hp.rmsEps, stream)
+      when defined(profileHippo):
+        recordStop(eventPairs, stream)
+        recordStart(eventPairs, kcLinearGateUp, stream)
+      gpuLinearCol(tmp0, xNormPtr, lw.wGate, hp.nEmb, hp.nFfn, 1, stream)
+      gpuLinearCol(tmp1, xNormPtr, lw.wUp, hp.nEmb, hp.nFfn, 1, stream)
+      when defined(profileHippo):
+        recordStop(eventPairs, stream)
+        recordStart(eventPairs, kcSiluMul, stream)
+      gpuSiluMul(tmp2, tmp0, tmp1, hp.nFfn, stream)
+      when defined(profileHippo):
+        recordStop(eventPairs, stream)
+        recordStart(eventPairs, kcLinearDown, stream)
+      gpuLinearCol(tmp0, tmp2, lw.wDown, hp.nFfn, hp.nEmb, 1, stream)
+      when defined(profileHippo):
+        recordStop(eventPairs, stream)
+        recordStart(eventPairs, kcResidualFfn, stream)
+      gpuAdd(xPtr, xPtr, tmp0, hp.nEmb, stream)
+      when defined(profileHippo):
+        recordStop(eventPairs, stream)
         kernelLaunchMs += (epochTime() - klStart) * 1000
 
-    let norm = getTensorOr(m, "norm.weight", "output_norm.weight")
-    let outW = outputWeightForLinear(m.getTensor("output.weight"), hp.nEmb, hp.nVocab)
-    let dNorm = cachedWeight("norm_or_output_norm.weight", norm)
-    let dOutW = cachedWeight("output.weight", outW)
-
-    gpuRmsnormCols(xNormPtr, xPtr, dNorm.devicePtr, hp.nEmb, 1, hp.rmsEps, stream)
-    gpuLinearCol(xPtr, xNormPtr, dOutW.devicePtr, outW.shape[0], outW.shape[1], 1, stream)
+    when defined(profileHippo):
+      recordStart(eventPairs, kcFinalNormOutput, stream)
+    gpuRmsnormCols(xNormPtr, xPtr, modelPtrs.normWeight, hp.nEmb, 1, hp.rmsEps, stream)
+    gpuLinearCol(xPtr, xNormPtr, modelPtrs.outputWeight, modelPtrs.outputShape0, modelPtrs.outputShape1, 1, stream)
+    when defined(profileHippo):
+      recordStop(eventPairs, stream)
 
     when defined(profileHippo):
       hippoEventRecord(gpuEndEvt, stream)
       let preSyncWall = epochTime()
 
-    result = newTensor(@[outW.shape[1], 1])
+    result = newTensor(@[modelPtrs.outputShape1, 1])
     let bytes = result.data.len * sizeof(float32)
     gpuDownloadFromDevice(addr result.data[0], xPtr, bytes, stream)
     gpuStreamSync(stream)
@@ -465,6 +524,7 @@ when defined(useHippo):
     when defined(profileHippo):
       let wallEnd = epochTime()
       hippoEventSynchronize(gpuEndEvt)
+      printBreakdown(eventPairs)
       let gpuMs = hippoEventElapsedTime(gpuStartEvt, gpuEndEvt)
       let totalMs = (wallEnd - wallStart) * 1000
       let cpuMs = (preSyncWall - wallStart) * 1000
@@ -472,9 +532,7 @@ when defined(useHippo):
       echo "decode[pos=", pos, "]: total=", totalMs.formatFloat(ffDecimal, 1), "ms",
            " cpu=", cpuMs.formatFloat(ffDecimal, 1), "ms",
            " sync=", syncMs.formatFloat(ffDecimal, 1), "ms",
-           " gpu=", gpuMs.formatFloat(ffDecimal, 1), "ms"
-      echo "  getTensor=", getTensorMs.formatFloat(ffDecimal, 1), "ms",
-           " cachedWeight=", cachedWeightMs.formatFloat(ffDecimal, 1), "ms",
+           " gpu=", gpuMs.formatFloat(ffDecimal, 1), "ms",
            " kernelLaunch=", kernelLaunchMs.formatFloat(ffDecimal, 1), "ms"
       hippoEventDestroy(gpuStartEvt)
       hippoEventDestroy(gpuEndEvt)
