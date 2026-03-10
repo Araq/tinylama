@@ -281,20 +281,74 @@ proc linearQ2KDecodeKernel(
       var acc = 0.0'f32
 
       var blkIdx = 0
+      # 4-way block unroll for ILP
+      while blkIdx + 3 < nBlocksPerRow:
+        # Block A
+        let blkStartA = rowBase + blkIdx * 84
+        let elemBaseA = blkIdx * 256
+        let dRawA = uint16(w[blkStartA + 80]) or (uint16(w[blkStartA + 81]) shl 8)
+        let dminRawA = uint16(w[blkStartA + 82]) or (uint16(w[blkStartA + 83]) shl 8)
+        let dA = hippoHalfToFloat(dRawA)
+        let dminA = hippoHalfToFloat(dminRawA)
+        let scA = w[blkStartA + q2_scaleIdx]
+        let dlA = dA * cfloat(scA and 0x0F'u8)
+        let mlA = dminA * cfloat(scA shr 4)
+        let qvalA = cfloat((w[blkStartA + 16 + q2_qsByteIdx] shr q2_shift) and 3)
+        acc = acc + (dlA * qvalA - mlA) * sx[elemBaseA + tid]
+
+        # Block B
+        let blkStartB = rowBase + (blkIdx + 1) * 84
+        let elemBaseB = (blkIdx + 1) * 256
+        let dRawB = uint16(w[blkStartB + 80]) or (uint16(w[blkStartB + 81]) shl 8)
+        let dminRawB = uint16(w[blkStartB + 82]) or (uint16(w[blkStartB + 83]) shl 8)
+        let dB = hippoHalfToFloat(dRawB)
+        let dminB = hippoHalfToFloat(dminRawB)
+        let scB = w[blkStartB + q2_scaleIdx]
+        let dlB = dB * cfloat(scB and 0x0F'u8)
+        let mlB = dminB * cfloat(scB shr 4)
+        let qvalB = cfloat((w[blkStartB + 16 + q2_qsByteIdx] shr q2_shift) and 3)
+        acc = acc + (dlB * qvalB - mlB) * sx[elemBaseB + tid]
+
+        # Block C
+        let blkStartC = rowBase + (blkIdx + 2) * 84
+        let elemBaseC = (blkIdx + 2) * 256
+        let dRawC = uint16(w[blkStartC + 80]) or (uint16(w[blkStartC + 81]) shl 8)
+        let dminRawC = uint16(w[blkStartC + 82]) or (uint16(w[blkStartC + 83]) shl 8)
+        let dC = hippoHalfToFloat(dRawC)
+        let dminC = hippoHalfToFloat(dminRawC)
+        let scC = w[blkStartC + q2_scaleIdx]
+        let dlC = dC * cfloat(scC and 0x0F'u8)
+        let mlC = dminC * cfloat(scC shr 4)
+        let qvalC = cfloat((w[blkStartC + 16 + q2_qsByteIdx] shr q2_shift) and 3)
+        acc = acc + (dlC * qvalC - mlC) * sx[elemBaseC + tid]
+
+        # Block D
+        let blkStartD = rowBase + (blkIdx + 3) * 84
+        let elemBaseD = (blkIdx + 3) * 256
+        let dRawD = uint16(w[blkStartD + 80]) or (uint16(w[blkStartD + 81]) shl 8)
+        let dminRawD = uint16(w[blkStartD + 82]) or (uint16(w[blkStartD + 83]) shl 8)
+        let dD = hippoHalfToFloat(dRawD)
+        let dminD = hippoHalfToFloat(dminRawD)
+        let scD = w[blkStartD + q2_scaleIdx]
+        let dlD = dD * cfloat(scD and 0x0F'u8)
+        let mlD = dminD * cfloat(scD shr 4)
+        let qvalD = cfloat((w[blkStartD + 16 + q2_qsByteIdx] shr q2_shift) and 3)
+        acc = acc + (dlD * qvalD - mlD) * sx[elemBaseD + tid]
+
+        blkIdx = blkIdx + 4
+
+      # Cleanup: remaining blocks
       while blkIdx < nBlocksPerRow:
         let blkStart = rowBase + blkIdx * 84
         let elemBase = blkIdx * 256
-
         let dRaw = uint16(w[blkStart + 80]) or (uint16(w[blkStart + 81]) shl 8)
         let dminRaw = uint16(w[blkStart + 82]) or (uint16(w[blkStart + 83]) shl 8)
         let d = hippoHalfToFloat(dRaw)
         let dmin = hippoHalfToFloat(dminRaw)
-
         let sc = w[blkStart + q2_scaleIdx]
         let dl = d * cfloat(sc and 0x0F'u8)
         let ml = dmin * cfloat(sc shr 4)
         let qval = cfloat((w[blkStart + 16 + q2_qsByteIdx] shr q2_shift) and 3)
-
         acc = acc + (dl * qval - ml) * sx[elemBase + tid]
         blkIdx = blkIdx + 1
 
@@ -411,31 +465,94 @@ proc linearQ3KDecodeKernel(
       var acc = 0.0'f32
 
       var blkIdx = 0
+      # 4-way block unroll for ILP
+      while blkIdx + 3 < nBlocksPerRow:
+        # Block A
+        let blkStartA = rowBase + blkIdx * 110
+        let elemBaseA = blkIdx * 256
+        let dRawA = uint16(w[blkStartA + 108]) or (uint16(w[blkStartA + 109]) shl 8)
+        let dAllA = hippoHalfToFloat(dRawA)
+        let sByteA = cint(w[blkStartA + sByteOff])
+        let tByteA = cint(w[blkStartA + tByteOff])
+        let lowA = (sByteA shr useHighShift) and 0x0F
+        let highA = ((tByteA shr auxShift) and 0x03) shl 4
+        let scaleByteA = lowA or highA
+        let scaleSignedA = ((scaleByteA xor 0x80) - 0x80)
+        let dlA = dAllA * cfloat(scaleSignedA - 32)
+        let qvalA = cint((w[blkStartA + 32 + qsByteIdx] shr shift) and 3)
+        let hmBitA = (cint(w[blkStartA + hmaskByteOff]) shr hmaskBitPos) and 1
+        let hmA = 4 - hmBitA * 4
+        acc = acc + dlA * cfloat(qvalA - hmA) * sx[elemBaseA + tid]
+
+        # Block B
+        let blkStartB = rowBase + (blkIdx + 1) * 110
+        let elemBaseB = (blkIdx + 1) * 256
+        let dRawB = uint16(w[blkStartB + 108]) or (uint16(w[blkStartB + 109]) shl 8)
+        let dAllB = hippoHalfToFloat(dRawB)
+        let sByteB = cint(w[blkStartB + sByteOff])
+        let tByteB = cint(w[blkStartB + tByteOff])
+        let lowB = (sByteB shr useHighShift) and 0x0F
+        let highB = ((tByteB shr auxShift) and 0x03) shl 4
+        let scaleByteB = lowB or highB
+        let scaleSignedB = ((scaleByteB xor 0x80) - 0x80)
+        let dlB = dAllB * cfloat(scaleSignedB - 32)
+        let qvalB = cint((w[blkStartB + 32 + qsByteIdx] shr shift) and 3)
+        let hmBitB = (cint(w[blkStartB + hmaskByteOff]) shr hmaskBitPos) and 1
+        let hmB = 4 - hmBitB * 4
+        acc = acc + dlB * cfloat(qvalB - hmB) * sx[elemBaseB + tid]
+
+        # Block C
+        let blkStartC = rowBase + (blkIdx + 2) * 110
+        let elemBaseC = (blkIdx + 2) * 256
+        let dRawC = uint16(w[blkStartC + 108]) or (uint16(w[blkStartC + 109]) shl 8)
+        let dAllC = hippoHalfToFloat(dRawC)
+        let sByteC = cint(w[blkStartC + sByteOff])
+        let tByteC = cint(w[blkStartC + tByteOff])
+        let lowC = (sByteC shr useHighShift) and 0x0F
+        let highC = ((tByteC shr auxShift) and 0x03) shl 4
+        let scaleByteC = lowC or highC
+        let scaleSignedC = ((scaleByteC xor 0x80) - 0x80)
+        let dlC = dAllC * cfloat(scaleSignedC - 32)
+        let qvalC = cint((w[blkStartC + 32 + qsByteIdx] shr shift) and 3)
+        let hmBitC = (cint(w[blkStartC + hmaskByteOff]) shr hmaskBitPos) and 1
+        let hmC = 4 - hmBitC * 4
+        acc = acc + dlC * cfloat(qvalC - hmC) * sx[elemBaseC + tid]
+
+        # Block D
+        let blkStartD = rowBase + (blkIdx + 3) * 110
+        let elemBaseD = (blkIdx + 3) * 256
+        let dRawD = uint16(w[blkStartD + 108]) or (uint16(w[blkStartD + 109]) shl 8)
+        let dAllD = hippoHalfToFloat(dRawD)
+        let sByteD = cint(w[blkStartD + sByteOff])
+        let tByteD = cint(w[blkStartD + tByteOff])
+        let lowD = (sByteD shr useHighShift) and 0x0F
+        let highD = ((tByteD shr auxShift) and 0x03) shl 4
+        let scaleByteD = lowD or highD
+        let scaleSignedD = ((scaleByteD xor 0x80) - 0x80)
+        let dlD = dAllD * cfloat(scaleSignedD - 32)
+        let qvalD = cint((w[blkStartD + 32 + qsByteIdx] shr shift) and 3)
+        let hmBitD = (cint(w[blkStartD + hmaskByteOff]) shr hmaskBitPos) and 1
+        let hmD = 4 - hmBitD * 4
+        acc = acc + dlD * cfloat(qvalD - hmD) * sx[elemBaseD + tid]
+
+        blkIdx = blkIdx + 4
+
+      # Cleanup: remaining blocks
       while blkIdx < nBlocksPerRow:
         let blkStart = rowBase + blkIdx * 110
         let elemBase = blkIdx * 256
-
-        # Read d (float16) from offset 108
         let dRaw = uint16(w[blkStart + 108]) or (uint16(w[blkStart + 109]) shl 8)
         let dAll = hippoHalfToFloat(dRaw)
-
-        # Extract scale: read 2 bytes, compute low/high nibbles
         let sByte = cint(w[blkStart + sByteOff])
         let tByte = cint(w[blkStart + tByteOff])
         let low = (sByte shr useHighShift) and 0x0F
         let high = ((tByte shr auxShift) and 0x03) shl 4
         let scaleByte = low or high
-        # Branchless sign extension: (x ^ 0x80) - 0x80
         let scaleSigned = ((scaleByte xor 0x80) - 0x80)
         let dl = dAll * cfloat(scaleSigned - 32)
-
-        # Extract 2-bit qval from qs (offset 32 in block)
         let qval = cint((w[blkStart + 32 + qsByteIdx] shr shift) and 3)
-
-        # Extract hmask bit branchlessly: 4 when bit=0, 0 when bit=1
         let hmBit = (cint(w[blkStart + hmaskByteOff]) shr hmaskBitPos) and 1
         let hm = 4 - hmBit * 4
-
         acc = acc + dl * cfloat(qval - hm) * sx[elemBase + tid]
         blkIdx = blkIdx + 1
 
