@@ -21,6 +21,13 @@ const
   defaultDecodeWarmup = 1
   defaultDecodeRuns = 2
 
+  # Reference output for Q2_K model with shortPrompt, 8 decode steps.
+  # "\nNimi is a small town in the"
+  expectedFirstToken: int32 = 13
+  expectedTokens: array[8, int32] = [
+    29940'i32, 10233, 338, 263, 2319, 4726, 297, 278
+  ]
+
 proc nowMs(): float64 =
   ## Return the current monotonic time in milliseconds.
   getMonoTime().ticks.float64 / 1_000_000.0
@@ -75,13 +82,15 @@ proc runDecodeSteps(
   decodeBase: KvCache,
   firstGenerated: int32,
   nVocab, decodeSteps: int
-) =
-  ## Run decode for a fixed token count from the same seeded cache state.
+): seq[int32] =
+  ## Run decode for a fixed token count. Returns generated token IDs.
   var cache = cloneCache(decodeBase)
   var next = firstGenerated
-  for _ in 0 ..< decodeSteps:
+  result = newSeq[int32](decodeSteps)
+  for i in 0 ..< decodeSteps:
     let logits = forwardDecode(m, next, cache)
     next = argmaxLast(logits, nVocab)
+    result[i] = next
 
 proc measureDecodeSamples(
   m: var Model,
@@ -93,7 +102,7 @@ proc measureDecodeSamples(
   result = newSeq[float64](decodeRuns)
   for i in 0 ..< decodeRuns:
     let startMs = nowMs()
-    runDecodeSteps(m, decodeBase, firstGenerated, nVocab, decodeSteps)
+    discard runDecodeSteps(m, decodeBase, firstGenerated, nVocab, decodeSteps)
     result[i] = nowMs() - startMs
 
 proc printDecodeSummary(samples: seq[float64], decodeSteps: int) =
@@ -183,9 +192,25 @@ proc main() =
     var cache = cloneCache(decodeBase)
     discard forwardDecode(m, firstGenerated, cache)
 
+  # Validate output correctness against known-good reference (8 decode steps)
+  block:
+    let validationTokens = runDecodeSteps(m, decodeBase, firstGenerated, nVocab, 8)
+    let text = detokenize(vocab, @[firstGenerated] & validationTokens)
+    echo "generated: ", text
+    if firstGenerated != expectedFirstToken:
+      echo "VALIDATION FAILED: firstGenerated = ", firstGenerated, ", expected ", expectedFirstToken
+      quit(1)
+    for i in 0 ..< 8:
+      if validationTokens[i] != expectedTokens[i]:
+        echo "VALIDATION FAILED at token ", i, ": got ", validationTokens[i], ", expected ", expectedTokens[i]
+        echo "  full expected: ", expectedTokens
+        echo "  full got:      ", validationTokens
+        quit(1)
+    echo "output validation passed"
+
   echo "warming decode benchmark..."
   for _ in 0 ..< decodeWarmup:
-    runDecodeSteps(m, decodeBase, firstGenerated, nVocab, decodeSteps)
+    discard runDecodeSteps(m, decodeBase, firstGenerated, nVocab, decodeSteps)
 
   echo "running decode samples..."
   let decodeSamples = measureDecodeSamples(
