@@ -1679,13 +1679,11 @@ proc attentionDecodeKernel(
   let kvh = h div group
   let hOff = h * int(headDim)
 
-  # Phase 1: compute attention scores - each thread handles some positions
-  # We use shared memory for partial max/sum
-  var scores {.hippoShared.}: array[2048, float32]  # max curLen we support per block
+  # Phase 1: compute attention scores
+  var scores {.hippoShared.}: array[2048, float32]
   var sMax {.hippoShared.}: array[HippoBlockSize, float32]
   var sSum {.hippoShared.}: array[HippoBlockSize, float32]
 
-  # Each thread computes scores for its positions
   var localMax = -1e30'f32
   var j = tid
   while j < int(curLen):
@@ -1721,14 +1719,7 @@ proc attentionDecodeKernel(
   reduceSum256(sSum, tid)
   let invSum = 1.0'f32 / sSum[0]
 
-  # Normalize scores
-  j = tid
-  while j < int(curLen):
-    scores[j] = scores[j] * invSum
-    j = j + int(blockDim.x)
-  hippoSyncthreads()
-
-  # Phase 2: weighted sum of V
+  # Phase 2: weighted sum of V (folding normalization into accumulation)
   var d = tid
   while d < int(headDim):
     var acc = 0.0'f32
@@ -1736,7 +1727,7 @@ proc attentionDecodeKernel(
       let vIdx = (kvh * int(headDim) + d) * int(cacheCols) + jj
       acc = acc + scores[jj] * vc[vIdx]
     let outIdx = hOff + d
-    o[outIdx] = acc
+    o[outIdx] = acc * invSum
     d = d + int(blockDim.x)
 
 proc gpuAttentionDecode*(dst: pointer, q, kCache, vCache: pointer,
