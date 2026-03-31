@@ -1,20 +1,21 @@
 ## Minimal tokenizer for GGUF models (SPM/LLaMA style).
 
-import std/[tables, heapqueue, strutils, sequtils]
-import ./gguf_loader
+import
+  std/[tables, heapqueue, strutils, sequtils],
+  ./gguf_loader
 
 const
-  tokenModelKey = "tokenizer.ggml.model"
-  tokenListKey = "tokenizer.ggml.tokens"
-  tokenScoresKey = "tokenizer.ggml.scores"
-  tokenTypesKey = "tokenizer.ggml.token_type"
-  tokenAddBosKey = "tokenizer.ggml.add_bos_token"
-  tokenAddEosKey = "tokenizer.ggml.add_eos_token"
-  tokenAddPrefixKey = "tokenizer.ggml.add_space_prefix"
-  tokenBosIdKey = "tokenizer.ggml.bos_token_id"
-  tokenEosIdKey = "tokenizer.ggml.eos_token_id"
-  tokenUnkIdKey = "tokenizer.ggml.unknown_token_id"
-  tokenChatTemplateKey = "tokenizer.chat_template"
+  TokenModelKey = "tokenizer.ggml.model"
+  TokenListKey = "tokenizer.ggml.tokens"
+  TokenScoresKey = "tokenizer.ggml.scores"
+  TokenTypesKey = "tokenizer.ggml.token_type"
+  TokenAddBosKey = "tokenizer.ggml.add_bos_token"
+  TokenAddEosKey = "tokenizer.ggml.add_eos_token"
+  TokenAddPrefixKey = "tokenizer.ggml.add_space_prefix"
+  TokenBosIdKey = "tokenizer.ggml.bos_token_id"
+  TokenEosIdKey = "tokenizer.ggml.eos_token_id"
+  TokenUnkIdKey = "tokenizer.ggml.unknown_token_id"
+  TokenChatTemplateKey = "tokenizer.chat_template"
 
 type
   TokenAttr* = enum
@@ -77,37 +78,37 @@ proc byteToToken(v: Vocab, ch: byte): int32 =
 
 proc loadVocab*(g: GgufFile): Vocab =
   var modelType: string
-  discard g.getKvStr(tokenModelKey, modelType)
+  discard g.getKvStr(TokenModelKey, modelType)
   var tokenList: seq[string]
-  let okTokens = g.getKvArrStr(tokenListKey, tokenList)
+  let okTokens = g.getKvArrStr(TokenListKey, tokenList)
   if not okTokens:
     raise newException(IOError, "tokenizer tokens missing")
 
   var scores: seq[float32]
-  discard g.getKvArrF32(tokenScoresKey, scores)
+  discard g.getKvArrF32(TokenScoresKey, scores)
   if scores.len != tokenList.len:
     scores.setLen(tokenList.len)
 
   var tokenTypes: seq[int32]
-  discard g.getKvArrI32(tokenTypesKey, tokenTypes)
+  discard g.getKvArrI32(TokenTypesKey, tokenTypes)
   if tokenTypes.len != tokenList.len:
     tokenTypes.setLen(tokenList.len)
 
   var addBos = false
   var addEos = false
   var addSpacePrefix = true
-  let hasAddBos = g.getKvBool(tokenAddBosKey, addBos)
-  discard g.getKvBool(tokenAddEosKey, addEos)
-  discard g.getKvBool(tokenAddPrefixKey, addSpacePrefix)
+  let hasAddBos = g.getKvBool(TokenAddBosKey, addBos)
+  discard g.getKvBool(TokenAddEosKey, addEos)
+  discard g.getKvBool(TokenAddPrefixKey, addSpacePrefix)
   if modelType == "llama" and not hasAddBos:
     addBos = true
 
   var bosId: int32 = 1
   var eosId: int32 = 2
   var unkId: int32 = 0
-  discard g.getKvI32(tokenBosIdKey, bosId)
-  discard g.getKvI32(tokenEosIdKey, eosId)
-  discard g.getKvI32(tokenUnkIdKey, unkId)
+  discard g.getKvI32(TokenBosIdKey, bosId)
+  discard g.getKvI32(TokenEosIdKey, eosId)
+  discard g.getKvI32(TokenUnkIdKey, unkId)
 
   result.modelType = modelType
   result.addBos = addBos
@@ -116,7 +117,7 @@ proc loadVocab*(g: GgufFile): Vocab =
   result.bosId = bosId
   result.eosId = eosId
   result.unkId = unkId
-  discard g.getKvStr(tokenChatTemplateKey, result.chatTemplate)
+  discard g.getKvStr(TokenChatTemplateKey, result.chatTemplate)
 
   result.tokens.setLen(tokenList.len)
   for i, tok in tokenList:

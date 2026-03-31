@@ -9,14 +9,24 @@ import
   benchy,
   ../src/[forward, gguf_loader, infer_core, model, tensor, tokenizer]
 
+when defined(useHippo):
+  import ../src/forward_hippo
+
 const
-  shortPrompt = "Write one sentence about Nim."
-  longPrompt =
+  ShortPrompt = "Write one sentence about Nim."
+  LongPrompt =
     "Explain transformers in simple terms, then give a compact example " &
     "of how token-by-token decoding works."
-  defaultDecodeSteps = 32
-  defaultDecodeWarmup = 1
-  defaultDecodeRuns = 4
+  DefaultDecodeSteps = 16
+  DefaultDecodeWarmup = 1
+  DefaultDecodeRuns = 2
+
+  # Reference output for Q2_K model with ShortPrompt, 8 decode steps.
+  # "\nNimi is a small town in the"
+  ExpectedFirstToken: int32 = 13
+  ExpectedTokens: array[8, int32] = [
+    29940'i32, 10233, 338, 263, 2319, 4726, 297, 278
+  ]
 
 proc nowMs(): float64 =
   ## Return the current monotonic time in milliseconds.
@@ -57,19 +67,30 @@ proc cloneCache(src: KvCache): KvCache =
       result.k[i].data[j] = src.k[i].data[j]
     for j in 0 ..< src.v[i].data.len:
       result.v[i].data[j] = src.v[i].data[j]
+  when defined(useHippo):
+    result.gpuCache = initGpuKvCache(src.k.len, src.nHeadKv, src.headDim, src.maxLen)
+    result.gpuCache.curLen = src.gpuCache.curLen
+    let stream = gpuCtx.stream
+    for i in 0 ..< src.k.len:
+      let bytes = src.k[i].data.len * sizeof(float32)
+      gpuMemcpyDevice(result.gpuCache.k[i].devicePtr, src.gpuCache.k[i].devicePtr, bytes, stream)
+      gpuMemcpyDevice(result.gpuCache.v[i].devicePtr, src.gpuCache.v[i].devicePtr, bytes, stream)
+    gpuStreamSync(stream)
 
 proc runDecodeSteps(
   m: var Model,
   decodeBase: KvCache,
   firstGenerated: int32,
   nVocab, decodeSteps: int
-) =
-  ## Run decode for a fixed token count from the same seeded cache state.
+): seq[int32] =
+  ## Run decode for a fixed token count. Returns generated token IDs.
   var cache = cloneCache(decodeBase)
   var next = firstGenerated
-  for _ in 0 ..< decodeSteps:
+  result = newSeq[int32](decodeSteps)
+  for i in 0 ..< decodeSteps:
     let logits = forwardDecode(m, next, cache)
     next = argmaxLast(logits, nVocab)
+    result[i] = next
 
 proc measureDecodeSamples(
   m: var Model,
@@ -81,7 +102,7 @@ proc measureDecodeSamples(
   result = newSeq[float64](decodeRuns)
   for i in 0 ..< decodeRuns:
     let startMs = nowMs()
-    runDecodeSteps(m, decodeBase, firstGenerated, nVocab, decodeSteps)
+    discard runDecodeSteps(m, decodeBase, firstGenerated, nVocab, decodeSteps)
     result[i] = nowMs() - startMs
 
 proc printDecodeSummary(samples: seq[float64], decodeSteps: int) =
@@ -109,9 +130,9 @@ proc main() =
 
   let modelPath = paramStr(1)
   var
-    decodeSteps = defaultDecodeSteps
-    decodeWarmup = defaultDecodeWarmup
-    decodeRuns = defaultDecodeRuns
+    decodeSteps = DefaultDecodeSteps
+    decodeWarmup = DefaultDecodeWarmup
+    decodeRuns = DefaultDecodeRuns
 
   var i = 2
   while i <= paramCount():
@@ -134,8 +155,8 @@ proc main() =
   let vocab = loadVocab(gg)
   gg.close()
 
-  let shortTokens = encodePromptTokens(vocab, shortPrompt)
-  let longTokens = encodePromptTokens(vocab, longPrompt)
+  let shortTokens = encodePromptTokens(vocab, ShortPrompt)
+  let longTokens = encodePromptTokens(vocab, LongPrompt)
 
   var m = loadModel(modelPath)
   defer: m.close()
@@ -154,10 +175,10 @@ proc main() =
   echo "decode sample runs:  ", decodeRuns
 
   timeIt "tokenize short prompt":
-    discard encodePromptTokens(vocab, shortPrompt)
+    discard encodePromptTokens(vocab, ShortPrompt)
 
   timeIt "tokenize long prompt":
-    discard encodePromptTokens(vocab, longPrompt)
+    discard encodePromptTokens(vocab, LongPrompt)
 
   timeIt "load model metadata":
     var lm = loadModel(modelPath)
@@ -171,9 +192,25 @@ proc main() =
     var cache = cloneCache(decodeBase)
     discard forwardDecode(m, firstGenerated, cache)
 
+  # Validate output correctness against known-good reference (8 decode steps)
+  block:
+    let validationTokens = runDecodeSteps(m, decodeBase, firstGenerated, nVocab, 8)
+    let text = detokenize(vocab, @[firstGenerated] & validationTokens)
+    echo "generated: ", text
+    if firstGenerated != ExpectedFirstToken:
+      echo "VALIDATION FAILED: firstGenerated = ", firstGenerated, ", expected ", ExpectedFirstToken
+      quit(1)
+    for i in 0 ..< 8:
+      if validationTokens[i] != ExpectedTokens[i]:
+        echo "VALIDATION FAILED at token ", i, ": got ", validationTokens[i], ", expected ", ExpectedTokens[i]
+        echo "  full expected: ", ExpectedTokens
+        echo "  full got:      ", validationTokens
+        quit(1)
+    echo "output validation passed"
+
   echo "warming decode benchmark..."
   for _ in 0 ..< decodeWarmup:
-    runDecodeSteps(m, decodeBase, firstGenerated, nVocab, decodeSteps)
+    discard runDecodeSteps(m, decodeBase, firstGenerated, nVocab, decodeSteps)
 
   echo "running decode samples..."
   let decodeSamples = measureDecodeSamples(
