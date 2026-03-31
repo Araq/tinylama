@@ -1,8 +1,12 @@
 ## Minimal CLI example: load GGUF and tokenize a prompt.
 
-import
-  std/[os, strutils],
-  ./[gguf_loader, tokenizer, model, forward, infer_core, tensor]
+import std/[os, strutils]
+import ./gguf_loader
+import ./tokenizer
+import ./model
+import ./forward
+import ./infer_core
+import ./tensor
 
 proc main() =
   if paramCount() < 1:

@@ -1,11 +1,11 @@
 ## Minimal model loader that reads GGUF tensors into float32.
 
-import
-  std/[tables],
-  ./[gguf_loader, tensor, quant]
-
+import std/[tables]
 when cpuEndian != littleEndian:
   import std/endians
+import ./gguf_loader
+import ./tensor
+import ./quant
 
 const
   GgmlTypeF32* = 0

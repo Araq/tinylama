@@ -1,7 +1,7 @@
 ## Shared inference helpers for CLI and benchmarks.
 
-import
-  ./[tokenizer, tensor]
+import ./tokenizer
+import ./tensor
 
 proc argmaxLast*(logits: Tensor, nVocab: int): int32 =
   ## Return the best token id from the final logits position.
