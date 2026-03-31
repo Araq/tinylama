@@ -74,18 +74,9 @@ nim c -r -d:release bench/bench_tinylama.nim \
   models/TinyLlama-1.1B-Chat-v1.0.Q2_K.gguf
 ```
 
-Decode-focused benchmark options:
-
-```bash
-nim c -r -d:release bench/bench_tinylama.nim \
-  models/TinyLlama-1.1B-Chat-v1.0.Q2_K.gguf \
-  --decode-steps 32 --decode-warmup 2 --decode-runs 8
-```
-
-This prints a decode summary with:
-- best/mean total decode latency
-- best/mean `ms/token`
-- best/mean `tok/s`
+The benchmark prints a decode summary with best/mean `ms/token` and `tok/s`.
+Defaults: 32 decode steps, 2 warmup runs, 8 sample runs.
+Override with `--decode-steps N`, `--decode-warmup N`, `--decode-runs N`.
 
 Optional Malebolgia parallel run:
 
@@ -97,7 +88,7 @@ nim c -r -d:release -d:useMalebolgia -d:ThreadPoolSize=8 -d:FixedChanSize=16 \
 Optional Hippo benchmark run (HIP via hipcc, AMD):
 
 ```bash
-nim cpp -r -d:release --cc:hipcc \
+HIP_PLATFORM=amd nim cpp -r -d:release --cc:hipcc \
   -d:useHippo -d:useMalloc --path:../hippo/src \
   bench/bench_tinylama.nim models/TinyLlama-1.1B-Chat-v1.0.Q2_K.gguf
 ```

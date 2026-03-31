@@ -17,9 +17,9 @@ const
   LongPrompt =
     "Explain transformers in simple terms, then give a compact example " &
     "of how token-by-token decoding works."
-  DefaultDecodeSteps = 16
-  DefaultDecodeWarmup = 1
-  DefaultDecodeRuns = 2
+  DefaultDecodeSteps = 32
+  DefaultDecodeWarmup = 2
+  DefaultDecodeRuns = 8
 
   # Reference output for Q2_K model with ShortPrompt, 8 decode steps.
   # "\nNimi is a small town in the"
