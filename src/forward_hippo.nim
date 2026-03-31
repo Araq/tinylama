@@ -268,6 +268,8 @@ type
     layers*: seq[LayerGpuPtrs]
     tokEmb*: pointer
     normWeight*, outputWeight*: pointer
+    outputWeightQ*: pointer  # quantized output weight (nil if float32)
+    outputQType*: int32
     outputShape0*, outputShape1*: int
     initialized*: bool
 
@@ -811,12 +813,106 @@ proc gpuLinearColQ3K*(dst, x, wQuant: pointer, wCols, wRows: int,
                       stream = stream,
                       args = hippoArgs(wPtr, xPtr, dPtr, outRowsArg, wColsArg))
 
+# ---------------------------------------------------------------------------
+# Q6_K GEMV decode (warp-per-row, WarpSize==32 only)
+# ---------------------------------------------------------------------------
+when HippoWarpSize == 32:
+  proc linearQ6KWarpDecodeKernel(
+    wData: ptr uint8,
+    xData, outData: ptr float32,
+    outRows, wCols: cint
+  ) {.hippoGlobal.} =
+    ## Warp-per-row Q6_K GEMV: 32 threads per row.
+    ## Q6K block = 210 bytes for 256 elements:
+    ##   ql[0..127], qh[128..191], sc[192..207], d[208..209]
+    let tid = cint(threadIdx.x)
+    let row = cint(blockIdx.x)
+    if row >= outRows:
+      return
+    let w = cast[ptr UncheckedArray[uint8]](wData)
+    let xArr = cast[ptr UncheckedArray[float32]](xData)
+    let outArr = cast[ptr UncheckedArray[float32]](outData)
+    let nBlocksPerRow = wCols div 256'i32
+    let rowSizeBytes = nBlocksPerRow * 210'i32
+    let rowBase = row * rowSizeBytes
+    var acc = 0.0'f32
+    var blkIdx = 0'i32
+    while blkIdx < nBlocksPerRow:
+      let bs = rowBase + blkIdx * 210'i32
+      let eb = blkIdx * 256'i32
+      # Read global scale d (fp16 at offset 208)
+      let dRaw = uint16(w[bs + 208'i32]) or (uint16(w[bs + 209'i32]) shl 8)
+      let dAll = hippoHalfToFloat(dRaw)
+      # Thread tid handles elements tid, tid+32, ..., tid+224
+      # Chunk 0 (elements 0-127): ql at bs+0, qh at bs+128, sc at bs+192
+      # Chunk 1 (elements 128-255): ql at bs+64, qh at bs+160, sc at bs+200
+      let scBase = bs + 192'i32
+      let scHalf = tid shr 4'i32  # 0 for tid 0-15, 1 for tid 16-31 (= scaleBlock)
+      # Chunk 0: elements tid, tid+32, tid+64, tid+96
+      # ql at bs+0..127, qh at bs+128..191
+      block:
+        let qlA = w[bs + tid]                # ql[tid] for q1 (low nibble) and q3 (high nibble)
+        let qlB = w[bs + 32'i32 + tid]       # ql[tid+32] for q2 and q4
+        let qhByte = w[bs + 128'i32 + tid]   # qh[tid]
+        let sc0 = cast[int8](w[scBase + scHalf])
+        let q1 = cint(qlA and 0x0F'u8) or (cint((qhByte shr 0'u8) and 3'u8) shl 4'i32) - 32'i32
+        acc = acc + dAll * cfloat(sc0) * cfloat(q1) * xArr[eb + tid]
+        let sc1 = cast[int8](w[scBase + 2'i32 + scHalf])
+        let q2 = cint(qlB and 0x0F'u8) or (cint((qhByte shr 2'u8) and 3'u8) shl 4'i32) - 32'i32
+        acc = acc + dAll * cfloat(sc1) * cfloat(q2) * xArr[eb + tid + 32'i32]
+        let sc2 = cast[int8](w[scBase + 4'i32 + scHalf])
+        let q3 = cint(qlA shr 4'u8) or (cint((qhByte shr 4'u8) and 3'u8) shl 4'i32) - 32'i32
+        acc = acc + dAll * cfloat(sc2) * cfloat(q3) * xArr[eb + tid + 64'i32]
+        let sc3 = cast[int8](w[scBase + 6'i32 + scHalf])
+        let q4 = cint(qlB shr 4'u8) or (cint((qhByte shr 6'u8) and 3'u8) shl 4'i32) - 32'i32
+        acc = acc + dAll * cfloat(sc3) * cfloat(q4) * xArr[eb + tid + 96'i32]
+      # Chunk 1: elements tid+128, tid+160, tid+192, tid+224
+      # ql at bs+64..127, qh at bs+160..191
+      block:
+        let qlA = w[bs + 64'i32 + tid]          # ql[64+tid]
+        let qlB = w[bs + 64'i32 + 32'i32 + tid] # ql[64+tid+32]
+        let qhByte = w[bs + 160'i32 + tid]      # qh[32+tid]
+        let sc0 = cast[int8](w[scBase + 8'i32 + scHalf])
+        let q1 = cint(qlA and 0x0F'u8) or (cint((qhByte shr 0'u8) and 3'u8) shl 4'i32) - 32'i32
+        acc = acc + dAll * cfloat(sc0) * cfloat(q1) * xArr[eb + tid + 128'i32]
+        let sc1 = cast[int8](w[scBase + 10'i32 + scHalf])
+        let q2 = cint(qlB and 0x0F'u8) or (cint((qhByte shr 2'u8) and 3'u8) shl 4'i32) - 32'i32
+        acc = acc + dAll * cfloat(sc1) * cfloat(q2) * xArr[eb + tid + 160'i32]
+        let sc2 = cast[int8](w[scBase + 12'i32 + scHalf])
+        let q3 = cint(qlA shr 4'u8) or (cint((qhByte shr 4'u8) and 3'u8) shl 4'i32) - 32'i32
+        acc = acc + dAll * cfloat(sc2) * cfloat(q3) * xArr[eb + tid + 192'i32]
+        let sc3 = cast[int8](w[scBase + 14'i32 + scHalf])
+        let q4 = cint(qlB shr 4'u8) or (cint((qhByte shr 6'u8) and 3'u8) shl 4'i32) - 32'i32
+        acc = acc + dAll * cfloat(sc3) * cfloat(q4) * xArr[eb + tid + 224'i32]
+      blkIdx = blkIdx + 1'i32
+    acc = acc + hippoShflDown(acc, 16)
+    acc = acc + hippoShflDown(acc, 8)
+    acc = acc + hippoShflDown(acc, 4)
+    acc = acc + hippoShflDown(acc, 2)
+    acc = acc + hippoShflDown(acc, 1)
+    if tid == 0'i32:
+      outArr[row] = acc
+
+proc gpuLinearColQ6K*(dst, x, wQuant: pointer, wCols, wRows: int,
+                       stream: HippoStream) =
+  when HippoWarpSize == 32:
+    let grid = newDim3(wRows.uint32)
+    let blk = newDim3(HippoWarpSize.uint32)
+    var wPtr = wQuant; var xPtr = x; var dPtr = dst
+    var outRowsArg = wRows.cint; var wColsArg = wCols.cint
+    hippoLaunchKernel(linearQ6KWarpDecodeKernel, gridDim = grid, blockDim = blk,
+                      stream = stream,
+                      args = hippoArgs(wPtr, xPtr, dPtr, outRowsArg, wColsArg))
+  else:
+    {.error: "gpuLinearColQ6K requires WarpSize == 32".}
+
 proc gpuLinearColQuant*(dst, x, wQuant: pointer, wCols, wRows: int,
                          quantType: int32, stream: HippoStream) =
   ## Dispatch to the appropriate quantized GEMV kernel based on quant type.
   case quantType
   of GgmlTypeQ2K: gpuLinearColQ2K(dst, x, wQuant, wCols, wRows, stream)
   of GgmlTypeQ3K: gpuLinearColQ3K(dst, x, wQuant, wCols, wRows, stream)
+  of GgmlTypeQ6K: gpuLinearColQ6K(dst, x, wQuant, wCols, wRows, stream)
   else: raise newException(ValueError, "unsupported quant type for GPU GEMV: " & $quantType)
 
 # ---------------------------------------------------------------------------
@@ -992,21 +1088,32 @@ proc ensureModelGpuPtrs*(m: var Model, hp: HParams) =
     norm = m.getTensor("norm.weight")
   modelPtrs.normWeight = cachedWeight("norm_or_output_norm.weight", norm).devicePtr
 
-  # Output weight — handle both orientations
-  let outW = m.getTensor("output.weight")
-  let a0 = outW.shape[0]
-  let a1 = outW.shape[1]
-  if a0 == hp.nEmb and a1 == hp.nVocab:
-    modelPtrs.outputWeight = cachedWeight("output.weight", outW).devicePtr
-    modelPtrs.outputShape0 = a0
-    modelPtrs.outputShape1 = a1
-  elif a0 == hp.nVocab and a1 == hp.nEmb:
-    let reshaped = outW.reshape(@[a1, a0])
-    modelPtrs.outputWeight = cachedWeight("output.weight", reshaped).devicePtr
-    modelPtrs.outputShape0 = a1
-    modelPtrs.outputShape1 = a0
+  # Output weight — try quantized upload for Q6K, else dequant to F32
+  let outElemType = m.infos["output.weight"].elemType.int32
+  if outElemType == GgmlTypeQ6K:
+    let qw = cachedQuantWeight("output.weight", m, "output.weight")
+    modelPtrs.outputWeightQ = qw.devicePtr
+    modelPtrs.outputWeight = nil
+    modelPtrs.outputQType = GgmlTypeQ6K
+    modelPtrs.outputShape0 = hp.nEmb       # wCols
+    modelPtrs.outputShape1 = hp.nVocab     # wRows
   else:
-    raise newException(ValueError, "output weight shape mismatch")
+    let outW = m.getTensor("output.weight")
+    let a0 = outW.shape[0]
+    let a1 = outW.shape[1]
+    if a0 == hp.nEmb and a1 == hp.nVocab:
+      modelPtrs.outputWeight = cachedWeight("output.weight", outW).devicePtr
+      modelPtrs.outputShape0 = a0
+      modelPtrs.outputShape1 = a1
+    elif a0 == hp.nVocab and a1 == hp.nEmb:
+      let reshaped = outW.reshape(@[a1, a0])
+      modelPtrs.outputWeight = cachedWeight("output.weight", reshaped).devicePtr
+      modelPtrs.outputShape0 = a1
+      modelPtrs.outputShape1 = a0
+    else:
+      raise newException(ValueError, "output weight shape mismatch")
+    modelPtrs.outputWeightQ = nil
+    modelPtrs.outputQType = 0
 
   modelPtrs.initialized = true
 

@@ -560,7 +560,12 @@ when defined(useHippo):
     when defined(profileHippo):
       recordStart(eventPairs, KcFinalNormOutput, stream)
     gpuRmsnormCols(xNormPtr, xPtr, modelPtrs.normWeight, hp.nEmb, 1, hp.rmsEps, stream)
-    gpuLinearCol(xPtr, xNormPtr, modelPtrs.outputWeight, modelPtrs.outputShape0, modelPtrs.outputShape1, 1, stream)
+    if modelPtrs.outputWeightQ != nil:
+      gpuLinearColQuant(xPtr, xNormPtr, modelPtrs.outputWeightQ,
+                        modelPtrs.outputShape0, modelPtrs.outputShape1,
+                        modelPtrs.outputQType, stream)
+    else:
+      gpuLinearCol(xPtr, xNormPtr, modelPtrs.outputWeight, modelPtrs.outputShape0, modelPtrs.outputShape1, 1, stream)
     when defined(profileHippo):
       recordStop(eventPairs, stream)
 
