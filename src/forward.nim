@@ -54,6 +54,7 @@ when defined(useMalebolgia):
   import malebolgia
 
 when defined(useHippo):
+  import hippo
   import ./forward_hippo
 
 proc getTensorOr(m: var Model, a, b: string): Tensor =
@@ -500,18 +501,37 @@ when defined(useHippo):
       when defined(profileHippo):
         recordStop(eventPairs, stream)
         recordStart(eventPairs, KcLinearGateUp, stream)
-      if lw.wGateQ != nil:
-        gpuLinearColQuant(tmp0, xNormPtr, lw.wGateQ, hp.nEmb, hp.nFfn, lw.wGateQType, stream)
+      when HippoWarpSize == 32:
+        if lw.wGateQType == GgmlTypeQ3K and lw.wUpQType == GgmlTypeQ3K:
+          # Fused gate+up+silu: single kernel launch, no intermediate buffers
+          gpuFusedGateUpSiluQ3K(tmp2, xNormPtr, lw.wGateQ, lw.wUpQ,
+                                hp.nEmb, hp.nFfn, stream)
+        else:
+          if lw.wGateQ != nil:
+            gpuLinearColQuant(tmp0, xNormPtr, lw.wGateQ, hp.nEmb, hp.nFfn, lw.wGateQType, stream)
+          else:
+            gpuLinearCol(tmp0, xNormPtr, lw.wGate, hp.nEmb, hp.nFfn, 1, stream)
+          if lw.wUpQ != nil:
+            gpuLinearColQuant(tmp1, xNormPtr, lw.wUpQ, hp.nEmb, hp.nFfn, lw.wUpQType, stream)
+          else:
+            gpuLinearCol(tmp1, xNormPtr, lw.wUp, hp.nEmb, hp.nFfn, 1, stream)
+          when defined(profileHippo):
+            recordStop(eventPairs, stream)
+            recordStart(eventPairs, KcSiluMul, stream)
+          gpuSiluMul(tmp2, tmp0, tmp1, hp.nFfn, stream)
       else:
-        gpuLinearCol(tmp0, xNormPtr, lw.wGate, hp.nEmb, hp.nFfn, 1, stream)
-      if lw.wUpQ != nil:
-        gpuLinearColQuant(tmp1, xNormPtr, lw.wUpQ, hp.nEmb, hp.nFfn, lw.wUpQType, stream)
-      else:
-        gpuLinearCol(tmp1, xNormPtr, lw.wUp, hp.nEmb, hp.nFfn, 1, stream)
-      when defined(profileHippo):
-        recordStop(eventPairs, stream)
-        recordStart(eventPairs, KcSiluMul, stream)
-      gpuSiluMul(tmp2, tmp0, tmp1, hp.nFfn, stream)
+        if lw.wGateQ != nil:
+          gpuLinearColQuant(tmp0, xNormPtr, lw.wGateQ, hp.nEmb, hp.nFfn, lw.wGateQType, stream)
+        else:
+          gpuLinearCol(tmp0, xNormPtr, lw.wGate, hp.nEmb, hp.nFfn, 1, stream)
+        if lw.wUpQ != nil:
+          gpuLinearColQuant(tmp1, xNormPtr, lw.wUpQ, hp.nEmb, hp.nFfn, lw.wUpQType, stream)
+        else:
+          gpuLinearCol(tmp1, xNormPtr, lw.wUp, hp.nEmb, hp.nFfn, 1, stream)
+        when defined(profileHippo):
+          recordStop(eventPairs, stream)
+          recordStart(eventPairs, KcSiluMul, stream)
+        gpuSiluMul(tmp2, tmp0, tmp1, hp.nFfn, stream)
       when defined(profileHippo):
         recordStop(eventPairs, stream)
         recordStart(eventPairs, KcLinearDown, stream)

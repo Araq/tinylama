@@ -831,6 +831,126 @@ proc gpuLinearColQuant*(dst, x, wQuant: pointer, wCols, wRows: int,
   of GgmlTypeQ3K: gpuLinearColQ3K(dst, x, wQuant, wCols, wRows, stream)
   else: raise newException(ValueError, "unsupported quant type for GPU GEMV: " & $quantType)
 
+# ---------------------------------------------------------------------------
+# Kernel: Fused Gate+Up+SiLU for Q3_K (warp-per-row, WarpSize==32 only)
+# Computes silu(gate_row · x) * (up_row · x) in a single kernel launch.
+# Eliminates 2 separate GEMV launches + SiluMul kernel per layer.
+# ---------------------------------------------------------------------------
+when HippoWarpSize == 32:
+  proc fusedGateUpSiluQ3KWarpKernel(
+    gateData, upData: ptr uint8,
+    xData, outData: ptr float32,
+    outRows, wCols: cint
+  ) {.hippoGlobal.} =
+    let tid = int(threadIdx.x)
+    let row = int(blockIdx.x)
+    if row >= int(outRows):
+      return
+    let gw = cast[ptr UncheckedArray[uint8]](gateData)
+    let uw = cast[ptr UncheckedArray[uint8]](upData)
+    let xArr = cast[ptr UncheckedArray[float32]](xData)
+    let outArr = cast[ptr UncheckedArray[float32]](outData)
+    let nBlocksPerRow = int(wCols) div 256
+    let rowSizeBytes = nBlocksPerRow * 110
+    let rowBase = row * rowSizeBytes
+    let sub = (tid shr 4) and 1
+    let qsOff0 = 32 + sub * 16 + (tid and 15)
+    let qsOff1 = 32 + 32 + sub * 16 + (tid and 15)
+    let hmOff = sub * 16 + (tid and 15)
+    var gateAcc = 0.0'f32
+    var upAcc = 0.0'f32
+    var blkIdx = 0
+    while blkIdx < nBlocksPerRow:
+      let gbs = rowBase + blkIdx * 110  # gate block start (same layout, different base ptr)
+      let ubs = rowBase + blkIdx * 110  # up block start
+      let eb = blkIdx * 256
+      # Read input vector elements once (shared between gate and up)
+      let x0 = xArr[eb + tid]
+      let x1 = xArr[eb + tid + 32]
+      let x2 = xArr[eb + tid + 64]
+      let x3 = xArr[eb + tid + 96]
+      let x4 = xArr[eb + tid + 128]
+      let x5 = xArr[eb + tid + 160]
+      let x6 = xArr[eb + tid + 192]
+      let x7 = xArr[eb + tid + 224]
+      # Gate: read weight bytes and dequantize
+      let gDRaw = uint16(gw[gbs + 108]) or (uint16(gw[gbs + 109]) shl 8)
+      let gDAll = hippoHalfToFloat(gDRaw)
+      let gQb0 = gw[gbs + qsOff0]
+      let gQb1 = gw[gbs + qsOff1]
+      let gHmByte = cint(gw[gbs + hmOff])
+      # Up: read weight bytes and dequantize
+      let uDRaw = uint16(uw[ubs + 108]) or (uint16(uw[ubs + 109]) shl 8)
+      let uDAll = hippoHalfToFloat(uDRaw)
+      let uQb0 = uw[ubs + qsOff0]
+      let uQb1 = uw[ubs + qsOff1]
+      let uHmByte = cint(uw[ubs + hmOff])
+      # Process 8 elements per thread for both gate and up
+      template fusedElem(scaleIdx: int, gQByte, uQByte: untyped, qShift, hmBitPos: int, xVal: float32) {.dirty.} =
+        block:
+          let si = scaleIdx
+          let big = si and 3
+          let ai = si shr 2
+          let sOff = 96 + (ai and 1) * 4 + big
+          let tOff = 104 + big
+          let lowShift = (ai shr 1) * 4
+          let highShift = ai * 2
+          # Gate scale + dequant
+          let gLow = (cint(gw[gbs + sOff]) shr lowShift) and 0x0F
+          let gHigh = ((cint(gw[gbs + tOff]) shr highShift) and 0x03) shl 4
+          let gSc = ((gLow or gHigh) xor 0x80) - 0x80
+          let gDl = gDAll * cfloat(gSc - 32)
+          let gQval = cint((gQByte shr qShift) and 3)
+          let gHm = 4 - ((gHmByte shr hmBitPos) and 1) * 4
+          gateAcc = gateAcc + gDl * cfloat(gQval - gHm) * xVal
+          # Up scale + dequant
+          let uLow = (cint(uw[ubs + sOff]) shr lowShift) and 0x0F
+          let uHigh = ((cint(uw[ubs + tOff]) shr highShift) and 0x03) shl 4
+          let uSc = ((uLow or uHigh) xor 0x80) - 0x80
+          let uDl = uDAll * cfloat(uSc - 32)
+          let uQval = cint((uQByte shr qShift) and 3)
+          let uHm = 4 - ((uHmByte shr hmBitPos) and 1) * 4
+          upAcc = upAcc + uDl * cfloat(uQval - uHm) * xVal
+      fusedElem(sub,       gQb0, uQb0, 0, 0, x0)
+      fusedElem(2 + sub,   gQb0, uQb0, 2, 1, x1)
+      fusedElem(4 + sub,   gQb0, uQb0, 4, 2, x2)
+      fusedElem(6 + sub,   gQb0, uQb0, 6, 3, x3)
+      fusedElem(8 + sub,   gQb1, uQb1, 0, 4, x4)
+      fusedElem(10 + sub,  gQb1, uQb1, 2, 5, x5)
+      fusedElem(12 + sub,  gQb1, uQb1, 4, 6, x6)
+      fusedElem(14 + sub,  gQb1, uQb1, 6, 7, x7)
+      blkIdx = blkIdx + 1
+    # Warp-shuffle reduction for both accumulators
+    gateAcc = gateAcc + hippoShflDown(gateAcc, 16)
+    gateAcc = gateAcc + hippoShflDown(gateAcc, 8)
+    gateAcc = gateAcc + hippoShflDown(gateAcc, 4)
+    gateAcc = gateAcc + hippoShflDown(gateAcc, 2)
+    gateAcc = gateAcc + hippoShflDown(gateAcc, 1)
+    upAcc = upAcc + hippoShflDown(upAcc, 16)
+    upAcc = upAcc + hippoShflDown(upAcc, 8)
+    upAcc = upAcc + hippoShflDown(upAcc, 4)
+    upAcc = upAcc + hippoShflDown(upAcc, 2)
+    upAcc = upAcc + hippoShflDown(upAcc, 1)
+    # Apply silu(gate) * up in-register and write single result
+    if tid == 0:
+      let g = gateAcc
+      let sigmoid = 1.0'f32 / (1.0'f32 + expf(-g))
+      outArr[row] = g * sigmoid * upAcc
+
+proc gpuFusedGateUpSiluQ3K*(dst, x, gateQuant, upQuant: pointer,
+                              wCols, wRows: int, stream: HippoStream) =
+  when HippoWarpSize == 32:
+    let grid = newDim3(wRows.uint32)
+    let blk = newDim3(HippoWarpSize.uint32)
+    var gPtr = gateQuant; var uPtr = upQuant
+    var xPtr = x; var dPtr = dst
+    var outRowsArg = wRows.cint; var wColsArg = wCols.cint
+    hippoLaunchKernel(fusedGateUpSiluQ3KWarpKernel, gridDim = grid, blockDim = blk,
+                      stream = stream,
+                      args = hippoArgs(gPtr, uPtr, xPtr, dPtr, outRowsArg, wColsArg))
+  else:
+    {.error: "gpuFusedGateUpSiluQ3K requires WarpSize == 32".}
+
 proc ensureModelGpuPtrs*(m: var Model, hp: HParams) =
   ## Populate modelPtrs once by caching all weight device pointers.
   if modelPtrs.initialized:
