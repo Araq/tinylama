@@ -1378,6 +1378,51 @@ proc ropeAtPosKernel(
       x[idx1] = v0 * ps + v1 * pc
       p = p + 1
 
+# Fused RoPE for Q and K decode (seqLen=1)
+proc ropeQKDecodeKernel(
+  qData, kData: ptr float32,
+  nHeadQ, nHeadK, headDim, ropeDim: cint,
+  ropeBase: float32, pos: cint
+) {.hippoGlobal.} =
+  let idx = cint(blockIdx.x * blockDim.x + threadIdx.x)
+  let halfRope = ropeDim div 2'i32
+  let qPairs = nHeadQ * halfRope
+  let totalPairs = qPairs + nHeadK * halfRope
+  if idx >= totalPairs:
+    return
+  let isK = idx >= qPairs
+  let localIdx = if isK: idx - qPairs else: idx
+  let nHead = if isK: nHeadK else: nHeadQ
+  let x = if isK: cast[ptr UncheckedArray[float32]](kData)
+          else: cast[ptr UncheckedArray[float32]](qData)
+  let h = localIdx div halfRope
+  let i = localIdx mod halfRope
+  let hOffset = h * headDim
+  let theta = powf(1.0'f32 / cfloat(ropeBase), cfloat(2'i32 * i) / cfloat(ropeDim))
+  let angle = cfloat(pos) * theta
+  let c = cosf(angle)
+  let s = sinf(angle)
+  let idx0 = hOffset + 2'i32 * i
+  let idx1 = hOffset + 2'i32 * i + 1'i32
+  let v0 = x[idx0]
+  let v1 = x[idx1]
+  x[idx0] = v0 * c - v1 * s
+  x[idx1] = v0 * s + v1 * c
+
+proc gpuRopeQKDecode*(q, k: pointer, nHeadQ, nHeadK, headDim, ropeDim: int,
+                       ropeBase: float32, pos: int, stream: HippoStream) =
+  let halfRope = ropeDim div 2
+  let totalPairs = nHeadQ * halfRope + nHeadK * halfRope
+  let grid = newDim3(((totalPairs + HippoBlockSize - 1) div HippoBlockSize).uint32)
+  let blk = newDim3(HippoBlockSize.uint32)
+  var qPtr = q; var kPtr = k
+  var nHQ = nHeadQ.cint; var nHK = nHeadK.cint
+  var hdArg = headDim.cint; var rdArg = ropeDim.cint
+  var rbArg = ropeBase; var posArg = pos.cint
+  hippoLaunchKernel(ropeQKDecodeKernel, gridDim = grid, blockDim = blk,
+                    stream = stream,
+                    args = hippoArgs(qPtr, kPtr, nHQ, nHK, hdArg, rdArg, rbArg, posArg))
+
 proc gpuRopeAtPos*(x: pointer, nHead, headDim, ropeDim: int,
                     ropeBase: float32, pos: int, seqLen: int,
                     stream: HippoStream) =

@@ -475,8 +475,7 @@ when defined(useHippo):
       when defined(profileHippo):
         recordStop(eventPairs, stream)
         recordStart(eventPairs, KcRope, stream)
-      gpuRopeAtPos(tmp0, hp.nHead, headDim, ropeDim, hp.ropeFreqBase, pos, 1, stream)
-      gpuRopeAtPos(tmp1, hp.nHeadKv, headDim, ropeDim, hp.ropeFreqBase, pos, 1, stream)
+      gpuRopeQKDecode(tmp0, tmp1, hp.nHead, hp.nHeadKv, headDim, ropeDim, hp.ropeFreqBase, pos, stream)
       when defined(profileHippo):
         recordStop(eventPairs, stream)
         recordStart(eventPairs, KcKvStore, stream)
