@@ -1349,7 +1349,7 @@ proc attentionDecodeKernel(
 
   # Phase 1: compute attention scores - each thread handles some positions
   # We use shared memory for partial max/sum
-  var scores {.hippoShared.}: array[4096, float32]  # max curLen we support per block
+  var scores {.hippoShared.}: array[2048, float32]  # max curLen we support per block
   var sMax {.hippoShared.}: array[HippoBlockSize, float32]
   var sSum {.hippoShared.}: array[HippoBlockSize, float32]
 
