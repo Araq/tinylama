@@ -5,10 +5,7 @@
 
 import
   std/tables,
-  ./tensor,
-  ./model,
-  ./gguf_loader,
-  ./quant
+  ./[tensor, model, gguf_loader, quant]
 
 when not defined(cpp):
   {.error: "useHippo requires Nim's C++ backend. Build with `nim cpp`.".}

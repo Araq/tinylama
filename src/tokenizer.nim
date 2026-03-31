@@ -1,7 +1,8 @@
 ## Minimal tokenizer for GGUF models (SPM/LLaMA style).
 
-import std/[tables, heapqueue, strutils, sequtils]
-import ./gguf_loader
+import
+  std/[tables, heapqueue, strutils, sequtils],
+  ./gguf_loader
 
 const
   tokenModelKey = "tokenizer.ggml.model"
