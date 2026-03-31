@@ -496,17 +496,92 @@ proc linearQ2KDecodeKernel(
       outArr[outRow] = sdata[0]
     hippoSyncthreads()
 
+when HippoWarpSize == 32:
+  proc linearQ2KWarpDecodeKernel(
+    wData: ptr uint8,
+    xData, outData: ptr float32,
+    outRows, wCols: cint
+  ) {.hippoGlobal.} =
+    ## Warp-per-row Q2_K GEMV: 32 threads per row, pure warp-shuffle reduction.
+    ## Each thread handles 8 elements per Q2_K block (256/32 = 8).
+    ## Eliminates all syncthreads and shared memory from the hot path.
+    let tid = int(threadIdx.x)
+    let row = int(blockIdx.x)
+    if row >= int(outRows):
+      return
+    let w = cast[ptr UncheckedArray[uint8]](wData)
+    let xArr = cast[ptr UncheckedArray[float32]](xData)
+    let outArr = cast[ptr UncheckedArray[float32]](outData)
+    let nBlocksPerRow = int(wCols) div 256
+    let rowSizeBytes = nBlocksPerRow * 84
+    let rowBase = row * rowSizeBytes
+    # Per-thread invariants: sub and l determine the qs byte offset.
+    # Thread t handles positions t, t+32, ..., t+224 within each Q2K block.
+    # These map to chunk 0 (iter 0-3) and chunk 1 (iter 0-3).
+    let sub = (tid shr 4) and 1
+    let qsOff0 = 16 + sub * 16 + (tid and 15)       # qs byte offset, chunk 0
+    let qsOff1 = 16 + 32 + sub * 16 + (tid and 15)  # qs byte offset, chunk 1
+    var acc = 0.0'f32
+    var blkIdx = 0
+    while blkIdx < nBlocksPerRow:
+      let bs = rowBase + blkIdx * 84
+      let eb = blkIdx * 256
+      # d and dmin shared across all 256 elements in the Q2K block
+      let dRaw = uint16(w[bs + 80]) or (uint16(w[bs + 81]) shl 8)
+      let dmRaw = uint16(w[bs + 82]) or (uint16(w[bs + 83]) shl 8)
+      let d = hippoHalfToFloat(dRaw)
+      let dm = hippoHalfToFloat(dmRaw)
+      # Load qs bytes — one per chunk, each containing 4 x 2-bit values
+      let qb0 = w[bs + qsOff0]
+      let qb1 = w[bs + qsOff1]
+      # Chunk 0, iterations 0-3
+      let sc0 = w[bs + sub]
+      acc = acc + (d * cfloat(sc0 and 0x0F) * cfloat(qb0 and 3) - dm * cfloat(sc0 shr 4)) * xArr[eb + tid]
+      let sc1 = w[bs + 2 + sub]
+      acc = acc + (d * cfloat(sc1 and 0x0F) * cfloat((qb0 shr 2) and 3) - dm * cfloat(sc1 shr 4)) * xArr[eb + tid + 32]
+      let sc2 = w[bs + 4 + sub]
+      acc = acc + (d * cfloat(sc2 and 0x0F) * cfloat((qb0 shr 4) and 3) - dm * cfloat(sc2 shr 4)) * xArr[eb + tid + 64]
+      let sc3 = w[bs + 6 + sub]
+      acc = acc + (d * cfloat(sc3 and 0x0F) * cfloat((qb0 shr 6) and 3) - dm * cfloat(sc3 shr 4)) * xArr[eb + tid + 96]
+      # Chunk 1, iterations 0-3
+      let sc4 = w[bs + 8 + sub]
+      acc = acc + (d * cfloat(sc4 and 0x0F) * cfloat(qb1 and 3) - dm * cfloat(sc4 shr 4)) * xArr[eb + tid + 128]
+      let sc5 = w[bs + 10 + sub]
+      acc = acc + (d * cfloat(sc5 and 0x0F) * cfloat((qb1 shr 2) and 3) - dm * cfloat(sc5 shr 4)) * xArr[eb + tid + 160]
+      let sc6 = w[bs + 12 + sub]
+      acc = acc + (d * cfloat(sc6 and 0x0F) * cfloat((qb1 shr 4) and 3) - dm * cfloat(sc6 shr 4)) * xArr[eb + tid + 192]
+      let sc7 = w[bs + 14 + sub]
+      acc = acc + (d * cfloat(sc7 and 0x0F) * cfloat((qb1 shr 6) and 3) - dm * cfloat(sc7 shr 4)) * xArr[eb + tid + 224]
+      blkIdx = blkIdx + 1
+    # Warp-shuffle reduction (no shared memory, no syncthreads)
+    acc = acc + hippoShflDown(acc, 16)
+    acc = acc + hippoShflDown(acc, 8)
+    acc = acc + hippoShflDown(acc, 4)
+    acc = acc + hippoShflDown(acc, 2)
+    acc = acc + hippoShflDown(acc, 1)
+    if tid == 0:
+      outArr[row] = acc
+
 proc gpuLinearColQ2K*(dst, x, wQuant: pointer, wCols, wRows: int,
                        stream: HippoStream) =
-  if wCols > HippoMaxDecodeCols:
-    raise newException(ValueError, "Q2K decode width exceeds limit: " & $wCols)
-  let grid = newDim3(((wRows + HippoDecodeRowsPerBlock - 1) div HippoDecodeRowsPerBlock).uint32)
-  let blk = newDim3(HippoBlockSize.uint32)
-  var wPtr = wQuant; var xPtr = x; var dPtr = dst
-  var outRowsArg = wRows.cint; var wColsArg = wCols.cint
-  hippoLaunchKernel(linearQ2KDecodeKernel, gridDim = grid, blockDim = blk,
-                    stream = stream,
-                    args = hippoArgs(wPtr, xPtr, dPtr, outRowsArg, wColsArg))
+  when HippoWarpSize == 32:
+    let grid = newDim3(wRows.uint32)
+    let blk = newDim3(HippoWarpSize.uint32)
+    var wPtr = wQuant; var xPtr = x; var dPtr = dst
+    var outRowsArg = wRows.cint; var wColsArg = wCols.cint
+    hippoLaunchKernel(linearQ2KWarpDecodeKernel, gridDim = grid, blockDim = blk,
+                      stream = stream,
+                      args = hippoArgs(wPtr, xPtr, dPtr, outRowsArg, wColsArg))
+  else:
+    if wCols > HippoMaxDecodeCols:
+      raise newException(ValueError, "Q2K decode width exceeds limit: " & $wCols)
+    let grid = newDim3(((wRows + HippoDecodeRowsPerBlock - 1) div HippoDecodeRowsPerBlock).uint32)
+    let blk = newDim3(HippoBlockSize.uint32)
+    var wPtr = wQuant; var xPtr = x; var dPtr = dst
+    var outRowsArg = wRows.cint; var wColsArg = wCols.cint
+    hippoLaunchKernel(linearQ2KDecodeKernel, gridDim = grid, blockDim = blk,
+                      stream = stream,
+                      args = hippoArgs(wPtr, xPtr, dPtr, outRowsArg, wColsArg))
 
 # ---------------------------------------------------------------------------
 # Kernel: Q3_K GEMV decode — reads raw quantized bytes, dequants on the fly
@@ -660,17 +735,93 @@ proc linearQ3KDecodeKernel(
       outArr[outRow] = sdata[0]
     hippoSyncthreads()
 
+when HippoWarpSize == 32:
+  proc linearQ3KWarpDecodeKernel(
+    wData: ptr uint8,
+    xData, outData: ptr float32,
+    outRows, wCols: cint
+  ) {.hippoGlobal.} =
+    ## Warp-per-row Q3_K GEMV: 32 threads per row, pure warp-shuffle reduction.
+    ## Each thread handles 8 elements per Q3_K block (256/32 = 8).
+    let tid = int(threadIdx.x)
+    let row = int(blockIdx.x)
+    if row >= int(outRows):
+      return
+    let w = cast[ptr UncheckedArray[uint8]](wData)
+    let xArr = cast[ptr UncheckedArray[float32]](xData)
+    let outArr = cast[ptr UncheckedArray[float32]](outData)
+    let nBlocksPerRow = int(wCols) div 256
+    let rowSizeBytes = nBlocksPerRow * 110
+    let rowBase = row * rowSizeBytes
+    let sub = (tid shr 4) and 1
+    let qsOff0 = 32 + sub * 16 + (tid and 15)       # qs byte offset, chunk 0
+    let qsOff1 = 32 + 32 + sub * 16 + (tid and 15)  # qs byte offset, chunk 1
+    let hmOff = sub * 16 + (tid and 15)               # hmask byte offset (same for both chunks)
+    var acc = 0.0'f32
+    var blkIdx = 0
+    while blkIdx < nBlocksPerRow:
+      let bs = rowBase + blkIdx * 110
+      let eb = blkIdx * 256
+      let dRaw = uint16(w[bs + 108]) or (uint16(w[bs + 109]) shl 8)
+      let dAll = hippoHalfToFloat(dRaw)
+      let qb0 = w[bs + qsOff0]
+      let qb1 = w[bs + qsOff1]
+      let hmByte = cint(w[bs + hmOff])
+      # Q3K scale extraction template: extracts 6-bit signed scale from packed 12-byte array
+      template q3kElem(scaleIdx, qByte: untyped, qShift, hmBitPos, xOff: int) {.dirty.} =
+        block:
+          let si = scaleIdx
+          let big = si and 3
+          let ai = si shr 2
+          let sByteVal = cint(w[bs + 96 + (ai and 1) * 4 + big])
+          let tByteVal = cint(w[bs + 104 + big])
+          let low = (sByteVal shr ((ai shr 1) * 4)) and 0x0F
+          let high = ((tByteVal shr (ai * 2)) and 0x03) shl 4
+          let scByte = low or high
+          let scSigned = (scByte xor 0x80) - 0x80
+          let dl = dAll * cfloat(scSigned - 32)
+          let qval = cint((qByte shr qShift) and 3)
+          let hm = 4 - ((hmByte shr hmBitPos) and 1) * 4
+          acc = acc + dl * cfloat(qval - hm) * xArr[eb + xOff]
+      # Chunk 0 (iter 0-3), chunk 1 (iter 0-3)
+      q3kElem(sub,       qb0, 0, 0, tid)
+      q3kElem(2 + sub,   qb0, 2, 1, tid + 32)
+      q3kElem(4 + sub,   qb0, 4, 2, tid + 64)
+      q3kElem(6 + sub,   qb0, 6, 3, tid + 96)
+      q3kElem(8 + sub,   qb1, 0, 4, tid + 128)
+      q3kElem(10 + sub,  qb1, 2, 5, tid + 160)
+      q3kElem(12 + sub,  qb1, 4, 6, tid + 192)
+      q3kElem(14 + sub,  qb1, 6, 7, tid + 224)
+      blkIdx = blkIdx + 1
+    # Warp-shuffle reduction (no shared memory, no syncthreads)
+    acc = acc + hippoShflDown(acc, 16)
+    acc = acc + hippoShflDown(acc, 8)
+    acc = acc + hippoShflDown(acc, 4)
+    acc = acc + hippoShflDown(acc, 2)
+    acc = acc + hippoShflDown(acc, 1)
+    if tid == 0:
+      outArr[row] = acc
+
 proc gpuLinearColQ3K*(dst, x, wQuant: pointer, wCols, wRows: int,
                        stream: HippoStream) =
-  if wCols > HippoMaxDecodeCols:
-    raise newException(ValueError, "Q3K decode width exceeds limit: " & $wCols)
-  let grid = newDim3(((wRows + HippoDecodeRowsPerBlock - 1) div HippoDecodeRowsPerBlock).uint32)
-  let blk = newDim3(HippoBlockSize.uint32)
-  var wPtr = wQuant; var xPtr = x; var dPtr = dst
-  var outRowsArg = wRows.cint; var wColsArg = wCols.cint
-  hippoLaunchKernel(linearQ3KDecodeKernel, gridDim = grid, blockDim = blk,
-                    stream = stream,
-                    args = hippoArgs(wPtr, xPtr, dPtr, outRowsArg, wColsArg))
+  when HippoWarpSize == 32:
+    let grid = newDim3(wRows.uint32)
+    let blk = newDim3(HippoWarpSize.uint32)
+    var wPtr = wQuant; var xPtr = x; var dPtr = dst
+    var outRowsArg = wRows.cint; var wColsArg = wCols.cint
+    hippoLaunchKernel(linearQ3KWarpDecodeKernel, gridDim = grid, blockDim = blk,
+                      stream = stream,
+                      args = hippoArgs(wPtr, xPtr, dPtr, outRowsArg, wColsArg))
+  else:
+    if wCols > HippoMaxDecodeCols:
+      raise newException(ValueError, "Q3K decode width exceeds limit: " & $wCols)
+    let grid = newDim3(((wRows + HippoDecodeRowsPerBlock - 1) div HippoDecodeRowsPerBlock).uint32)
+    let blk = newDim3(HippoBlockSize.uint32)
+    var wPtr = wQuant; var xPtr = x; var dPtr = dst
+    var outRowsArg = wRows.cint; var wColsArg = wCols.cint
+    hippoLaunchKernel(linearQ3KDecodeKernel, gridDim = grid, blockDim = blk,
+                      stream = stream,
+                      args = hippoArgs(wPtr, xPtr, dPtr, outRowsArg, wColsArg))
 
 proc gpuLinearColQuant*(dst, x, wQuant: pointer, wCols, wRows: int,
                          quantType: int32, stream: HippoStream) =
