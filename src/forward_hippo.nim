@@ -503,63 +503,54 @@ when HippoWarpSize == 32:
     outRows, wCols: cint
   ) {.hippoGlobal.} =
     ## Warp-per-row Q2_K GEMV: 32 threads per row, pure warp-shuffle reduction.
-    ## Each thread handles 8 elements per Q2_K block (256/32 = 8).
-    ## Eliminates all syncthreads and shared memory from the hot path.
-    let tid = int(threadIdx.x)
-    let row = int(blockIdx.x)
-    if row >= int(outRows):
+    ## All index arithmetic uses 32-bit integers to halve ALU cost on GPU.
+    let tid = cint(threadIdx.x)
+    let row = cint(blockIdx.x)
+    if row >= outRows:
       return
     let w = cast[ptr UncheckedArray[uint8]](wData)
     let xArr = cast[ptr UncheckedArray[float32]](xData)
     let outArr = cast[ptr UncheckedArray[float32]](outData)
-    let nBlocksPerRow = int(wCols) div 256
-    let rowSizeBytes = nBlocksPerRow * 84
+    let nBlocksPerRow = wCols div 256'i32
+    let rowSizeBytes = nBlocksPerRow * 84'i32
     let rowBase = row * rowSizeBytes
-    # Per-thread invariants: sub and l determine the qs byte offset.
-    # Thread t handles positions t, t+32, ..., t+224 within each Q2K block.
-    # These map to chunk 0 (iter 0-3) and chunk 1 (iter 0-3).
-    let sub = (tid shr 4) and 1
-    let qsOff0 = 16 + sub * 16 + (tid and 15)       # qs byte offset, chunk 0
-    let qsOff1 = 16 + 32 + sub * 16 + (tid and 15)  # qs byte offset, chunk 1
+    let sub = (tid shr 4'i32) and 1'i32
+    let qsOff0 = 16'i32 + sub * 16'i32 + (tid and 15'i32)
+    let qsOff1 = 48'i32 + sub * 16'i32 + (tid and 15'i32)
     var acc = 0.0'f32
-    var blkIdx = 0
+    var blkIdx = 0'i32
     while blkIdx < nBlocksPerRow:
-      let bs = rowBase + blkIdx * 84
-      let eb = blkIdx * 256
-      # d and dmin shared across all 256 elements in the Q2K block
-      let dRaw = uint16(w[bs + 80]) or (uint16(w[bs + 81]) shl 8)
-      let dmRaw = uint16(w[bs + 82]) or (uint16(w[bs + 83]) shl 8)
+      let bs = rowBase + blkIdx * 84'i32
+      let eb = blkIdx * 256'i32
+      let dRaw = uint16(w[bs + 80'i32]) or (uint16(w[bs + 81'i32]) shl 8)
+      let dmRaw = uint16(w[bs + 82'i32]) or (uint16(w[bs + 83'i32]) shl 8)
       let d = hippoHalfToFloat(dRaw)
       let dm = hippoHalfToFloat(dmRaw)
-      # Load qs bytes — one per chunk, each containing 4 x 2-bit values
       let qb0 = w[bs + qsOff0]
       let qb1 = w[bs + qsOff1]
-      # Chunk 0, iterations 0-3
       let sc0 = w[bs + sub]
       acc = acc + (d * cfloat(sc0 and 0x0F) * cfloat(qb0 and 3) - dm * cfloat(sc0 shr 4)) * xArr[eb + tid]
-      let sc1 = w[bs + 2 + sub]
-      acc = acc + (d * cfloat(sc1 and 0x0F) * cfloat((qb0 shr 2) and 3) - dm * cfloat(sc1 shr 4)) * xArr[eb + tid + 32]
-      let sc2 = w[bs + 4 + sub]
-      acc = acc + (d * cfloat(sc2 and 0x0F) * cfloat((qb0 shr 4) and 3) - dm * cfloat(sc2 shr 4)) * xArr[eb + tid + 64]
-      let sc3 = w[bs + 6 + sub]
-      acc = acc + (d * cfloat(sc3 and 0x0F) * cfloat((qb0 shr 6) and 3) - dm * cfloat(sc3 shr 4)) * xArr[eb + tid + 96]
-      # Chunk 1, iterations 0-3
-      let sc4 = w[bs + 8 + sub]
-      acc = acc + (d * cfloat(sc4 and 0x0F) * cfloat(qb1 and 3) - dm * cfloat(sc4 shr 4)) * xArr[eb + tid + 128]
-      let sc5 = w[bs + 10 + sub]
-      acc = acc + (d * cfloat(sc5 and 0x0F) * cfloat((qb1 shr 2) and 3) - dm * cfloat(sc5 shr 4)) * xArr[eb + tid + 160]
-      let sc6 = w[bs + 12 + sub]
-      acc = acc + (d * cfloat(sc6 and 0x0F) * cfloat((qb1 shr 4) and 3) - dm * cfloat(sc6 shr 4)) * xArr[eb + tid + 192]
-      let sc7 = w[bs + 14 + sub]
-      acc = acc + (d * cfloat(sc7 and 0x0F) * cfloat((qb1 shr 6) and 3) - dm * cfloat(sc7 shr 4)) * xArr[eb + tid + 224]
-      blkIdx = blkIdx + 1
-    # Warp-shuffle reduction (no shared memory, no syncthreads)
+      let sc1 = w[bs + 2'i32 + sub]
+      acc = acc + (d * cfloat(sc1 and 0x0F) * cfloat((qb0 shr 2) and 3) - dm * cfloat(sc1 shr 4)) * xArr[eb + tid + 32'i32]
+      let sc2 = w[bs + 4'i32 + sub]
+      acc = acc + (d * cfloat(sc2 and 0x0F) * cfloat((qb0 shr 4) and 3) - dm * cfloat(sc2 shr 4)) * xArr[eb + tid + 64'i32]
+      let sc3 = w[bs + 6'i32 + sub]
+      acc = acc + (d * cfloat(sc3 and 0x0F) * cfloat((qb0 shr 6) and 3) - dm * cfloat(sc3 shr 4)) * xArr[eb + tid + 96'i32]
+      let sc4 = w[bs + 8'i32 + sub]
+      acc = acc + (d * cfloat(sc4 and 0x0F) * cfloat(qb1 and 3) - dm * cfloat(sc4 shr 4)) * xArr[eb + tid + 128'i32]
+      let sc5 = w[bs + 10'i32 + sub]
+      acc = acc + (d * cfloat(sc5 and 0x0F) * cfloat((qb1 shr 2) and 3) - dm * cfloat(sc5 shr 4)) * xArr[eb + tid + 160'i32]
+      let sc6 = w[bs + 12'i32 + sub]
+      acc = acc + (d * cfloat(sc6 and 0x0F) * cfloat((qb1 shr 4) and 3) - dm * cfloat(sc6 shr 4)) * xArr[eb + tid + 192'i32]
+      let sc7 = w[bs + 14'i32 + sub]
+      acc = acc + (d * cfloat(sc7 and 0x0F) * cfloat((qb1 shr 6) and 3) - dm * cfloat(sc7 shr 4)) * xArr[eb + tid + 224'i32]
+      blkIdx = blkIdx + 1'i32
     acc = acc + hippoShflDown(acc, 16)
     acc = acc + hippoShflDown(acc, 8)
     acc = acc + hippoShflDown(acc, 4)
     acc = acc + hippoShflDown(acc, 2)
     acc = acc + hippoShflDown(acc, 1)
-    if tid == 0:
+    if tid == 0'i32:
       outArr[row] = acc
 
 proc gpuLinearColQ2K*(dst, x, wQuant: pointer, wCols, wRows: int,
@@ -742,64 +733,61 @@ when HippoWarpSize == 32:
     outRows, wCols: cint
   ) {.hippoGlobal.} =
     ## Warp-per-row Q3_K GEMV: 32 threads per row, pure warp-shuffle reduction.
-    ## Each thread handles 8 elements per Q3_K block (256/32 = 8).
-    let tid = int(threadIdx.x)
-    let row = int(blockIdx.x)
-    if row >= int(outRows):
+    ## All index arithmetic uses 32-bit integers to halve ALU cost on GPU.
+    let tid = cint(threadIdx.x)
+    let row = cint(blockIdx.x)
+    if row >= outRows:
       return
     let w = cast[ptr UncheckedArray[uint8]](wData)
     let xArr = cast[ptr UncheckedArray[float32]](xData)
     let outArr = cast[ptr UncheckedArray[float32]](outData)
-    let nBlocksPerRow = int(wCols) div 256
-    let rowSizeBytes = nBlocksPerRow * 110
+    let nBlocksPerRow = wCols div 256'i32
+    let rowSizeBytes = nBlocksPerRow * 110'i32
     let rowBase = row * rowSizeBytes
-    let sub = (tid shr 4) and 1
-    let qsOff0 = 32 + sub * 16 + (tid and 15)       # qs byte offset, chunk 0
-    let qsOff1 = 32 + 32 + sub * 16 + (tid and 15)  # qs byte offset, chunk 1
-    let hmOff = sub * 16 + (tid and 15)               # hmask byte offset (same for both chunks)
+    let sub = (tid shr 4'i32) and 1'i32
+    let qsOff0 = 32'i32 + sub * 16'i32 + (tid and 15'i32)
+    let qsOff1 = 64'i32 + sub * 16'i32 + (tid and 15'i32)
+    let hmOff = sub * 16'i32 + (tid and 15'i32)
     var acc = 0.0'f32
-    var blkIdx = 0
+    var blkIdx = 0'i32
     while blkIdx < nBlocksPerRow:
-      let bs = rowBase + blkIdx * 110
-      let eb = blkIdx * 256
-      let dRaw = uint16(w[bs + 108]) or (uint16(w[bs + 109]) shl 8)
+      let bs = rowBase + blkIdx * 110'i32
+      let eb = blkIdx * 256'i32
+      let dRaw = uint16(w[bs + 108'i32]) or (uint16(w[bs + 109'i32]) shl 8)
       let dAll = hippoHalfToFloat(dRaw)
       let qb0 = w[bs + qsOff0]
       let qb1 = w[bs + qsOff1]
       let hmByte = cint(w[bs + hmOff])
-      # Q3K scale extraction template: extracts 6-bit signed scale from packed 12-byte array
-      template q3kElem(scaleIdx, qByte: untyped, qShift, hmBitPos, xOff: int) {.dirty.} =
+      template q3kElem(scaleIdx: cint, qByte: untyped, qShift, hmBitPos, xOff: cint) {.dirty.} =
         block:
           let si = scaleIdx
-          let big = si and 3
-          let ai = si shr 2
-          let sByteVal = cint(w[bs + 96 + (ai and 1) * 4 + big])
-          let tByteVal = cint(w[bs + 104 + big])
-          let low = (sByteVal shr ((ai shr 1) * 4)) and 0x0F
-          let high = ((tByteVal shr (ai * 2)) and 0x03) shl 4
+          let big = si and 3'i32
+          let ai = si shr 2'i32
+          let sByteVal = cint(w[bs + 96'i32 + (ai and 1'i32) * 4'i32 + big])
+          let tByteVal = cint(w[bs + 104'i32 + big])
+          let low = (sByteVal shr ((ai shr 1'i32) * 4'i32)) and 0x0F'i32
+          let high = ((tByteVal shr (ai * 2'i32)) and 0x03'i32) shl 4'i32
           let scByte = low or high
-          let scSigned = (scByte xor 0x80) - 0x80
-          let dl = dAll * cfloat(scSigned - 32)
+          let scSigned = (scByte xor 0x80'i32) - 0x80'i32
+          let dl = dAll * cfloat(scSigned - 32'i32)
           let qval = cint((qByte shr qShift) and 3)
-          let hm = 4 - ((hmByte shr hmBitPos) and 1) * 4
+          let hm = 4'i32 - ((hmByte shr hmBitPos) and 1'i32) * 4'i32
           acc = acc + dl * cfloat(qval - hm) * xArr[eb + xOff]
-      # Chunk 0 (iter 0-3), chunk 1 (iter 0-3)
-      q3kElem(sub,       qb0, 0, 0, tid)
-      q3kElem(2 + sub,   qb0, 2, 1, tid + 32)
-      q3kElem(4 + sub,   qb0, 4, 2, tid + 64)
-      q3kElem(6 + sub,   qb0, 6, 3, tid + 96)
-      q3kElem(8 + sub,   qb1, 0, 4, tid + 128)
-      q3kElem(10 + sub,  qb1, 2, 5, tid + 160)
-      q3kElem(12 + sub,  qb1, 4, 6, tid + 192)
-      q3kElem(14 + sub,  qb1, 6, 7, tid + 224)
-      blkIdx = blkIdx + 1
-    # Warp-shuffle reduction (no shared memory, no syncthreads)
+      q3kElem(sub,            qb0, 0, 0, tid)
+      q3kElem(2'i32 + sub,    qb0, 2, 1, tid + 32'i32)
+      q3kElem(4'i32 + sub,    qb0, 4, 2, tid + 64'i32)
+      q3kElem(6'i32 + sub,    qb0, 6, 3, tid + 96'i32)
+      q3kElem(8'i32 + sub,    qb1, 0, 4, tid + 128'i32)
+      q3kElem(10'i32 + sub,   qb1, 2, 5, tid + 160'i32)
+      q3kElem(12'i32 + sub,   qb1, 4, 6, tid + 192'i32)
+      q3kElem(14'i32 + sub,   qb1, 6, 7, tid + 224'i32)
+      blkIdx = blkIdx + 1'i32
     acc = acc + hippoShflDown(acc, 16)
     acc = acc + hippoShflDown(acc, 8)
     acc = acc + hippoShflDown(acc, 4)
     acc = acc + hippoShflDown(acc, 2)
     acc = acc + hippoShflDown(acc, 1)
-    if tid == 0:
+    if tid == 0'i32:
       outArr[row] = acc
 
 proc gpuLinearColQ3K*(dst, x, wQuant: pointer, wCols, wRows: int,
@@ -842,85 +830,79 @@ when HippoWarpSize == 32:
     xData, outData: ptr float32,
     outRows, wCols: cint
   ) {.hippoGlobal.} =
-    let tid = int(threadIdx.x)
-    let row = int(blockIdx.x)
-    if row >= int(outRows):
+    ## Fused gate+up+silu Q3K GEMV with 32-bit index arithmetic.
+    let tid = cint(threadIdx.x)
+    let row = cint(blockIdx.x)
+    if row >= outRows:
       return
     let gw = cast[ptr UncheckedArray[uint8]](gateData)
     let uw = cast[ptr UncheckedArray[uint8]](upData)
     let xArr = cast[ptr UncheckedArray[float32]](xData)
     let outArr = cast[ptr UncheckedArray[float32]](outData)
-    let nBlocksPerRow = int(wCols) div 256
-    let rowSizeBytes = nBlocksPerRow * 110
+    let nBlocksPerRow = wCols div 256'i32
+    let rowSizeBytes = nBlocksPerRow * 110'i32
     let rowBase = row * rowSizeBytes
-    let sub = (tid shr 4) and 1
-    let qsOff0 = 32 + sub * 16 + (tid and 15)
-    let qsOff1 = 32 + 32 + sub * 16 + (tid and 15)
-    let hmOff = sub * 16 + (tid and 15)
+    let sub = (tid shr 4'i32) and 1'i32
+    let qsOff0 = 32'i32 + sub * 16'i32 + (tid and 15'i32)
+    let qsOff1 = 64'i32 + sub * 16'i32 + (tid and 15'i32)
+    let hmOff = sub * 16'i32 + (tid and 15'i32)
     var gateAcc = 0.0'f32
     var upAcc = 0.0'f32
-    var blkIdx = 0
+    var blkIdx = 0'i32
     while blkIdx < nBlocksPerRow:
-      let gbs = rowBase + blkIdx * 110  # gate block start (same layout, different base ptr)
-      let ubs = rowBase + blkIdx * 110  # up block start
-      let eb = blkIdx * 256
-      # Read input vector elements once (shared between gate and up)
+      let gbs = rowBase + blkIdx * 110'i32
+      let ubs = rowBase + blkIdx * 110'i32
+      let eb = blkIdx * 256'i32
       let x0 = xArr[eb + tid]
-      let x1 = xArr[eb + tid + 32]
-      let x2 = xArr[eb + tid + 64]
-      let x3 = xArr[eb + tid + 96]
-      let x4 = xArr[eb + tid + 128]
-      let x5 = xArr[eb + tid + 160]
-      let x6 = xArr[eb + tid + 192]
-      let x7 = xArr[eb + tid + 224]
-      # Gate: read weight bytes and dequantize
-      let gDRaw = uint16(gw[gbs + 108]) or (uint16(gw[gbs + 109]) shl 8)
+      let x1 = xArr[eb + tid + 32'i32]
+      let x2 = xArr[eb + tid + 64'i32]
+      let x3 = xArr[eb + tid + 96'i32]
+      let x4 = xArr[eb + tid + 128'i32]
+      let x5 = xArr[eb + tid + 160'i32]
+      let x6 = xArr[eb + tid + 192'i32]
+      let x7 = xArr[eb + tid + 224'i32]
+      let gDRaw = uint16(gw[gbs + 108'i32]) or (uint16(gw[gbs + 109'i32]) shl 8)
       let gDAll = hippoHalfToFloat(gDRaw)
       let gQb0 = gw[gbs + qsOff0]
       let gQb1 = gw[gbs + qsOff1]
       let gHmByte = cint(gw[gbs + hmOff])
-      # Up: read weight bytes and dequantize
-      let uDRaw = uint16(uw[ubs + 108]) or (uint16(uw[ubs + 109]) shl 8)
+      let uDRaw = uint16(uw[ubs + 108'i32]) or (uint16(uw[ubs + 109'i32]) shl 8)
       let uDAll = hippoHalfToFloat(uDRaw)
       let uQb0 = uw[ubs + qsOff0]
       let uQb1 = uw[ubs + qsOff1]
       let uHmByte = cint(uw[ubs + hmOff])
-      # Process 8 elements per thread for both gate and up
-      template fusedElem(scaleIdx: int, gQByte, uQByte: untyped, qShift, hmBitPos: int, xVal: float32) {.dirty.} =
+      template fusedElem(scaleIdx: cint, gQByte, uQByte: untyped, qShift, hmBitPos: cint, xVal: float32) {.dirty.} =
         block:
           let si = scaleIdx
-          let big = si and 3
-          let ai = si shr 2
-          let sOff = 96 + (ai and 1) * 4 + big
-          let tOff = 104 + big
-          let lowShift = (ai shr 1) * 4
-          let highShift = ai * 2
-          # Gate scale + dequant
-          let gLow = (cint(gw[gbs + sOff]) shr lowShift) and 0x0F
-          let gHigh = ((cint(gw[gbs + tOff]) shr highShift) and 0x03) shl 4
-          let gSc = ((gLow or gHigh) xor 0x80) - 0x80
-          let gDl = gDAll * cfloat(gSc - 32)
+          let big = si and 3'i32
+          let ai = si shr 2'i32
+          let sOff = 96'i32 + (ai and 1'i32) * 4'i32 + big
+          let tOff = 104'i32 + big
+          let lowShift = (ai shr 1'i32) * 4'i32
+          let highShift = ai * 2'i32
+          let gLow = (cint(gw[gbs + sOff]) shr lowShift) and 0x0F'i32
+          let gHigh = ((cint(gw[gbs + tOff]) shr highShift) and 0x03'i32) shl 4'i32
+          let gSc = ((gLow or gHigh) xor 0x80'i32) - 0x80'i32
+          let gDl = gDAll * cfloat(gSc - 32'i32)
           let gQval = cint((gQByte shr qShift) and 3)
-          let gHm = 4 - ((gHmByte shr hmBitPos) and 1) * 4
+          let gHm = 4'i32 - ((gHmByte shr hmBitPos) and 1'i32) * 4'i32
           gateAcc = gateAcc + gDl * cfloat(gQval - gHm) * xVal
-          # Up scale + dequant
-          let uLow = (cint(uw[ubs + sOff]) shr lowShift) and 0x0F
-          let uHigh = ((cint(uw[ubs + tOff]) shr highShift) and 0x03) shl 4
-          let uSc = ((uLow or uHigh) xor 0x80) - 0x80
-          let uDl = uDAll * cfloat(uSc - 32)
+          let uLow = (cint(uw[ubs + sOff]) shr lowShift) and 0x0F'i32
+          let uHigh = ((cint(uw[ubs + tOff]) shr highShift) and 0x03'i32) shl 4'i32
+          let uSc = ((uLow or uHigh) xor 0x80'i32) - 0x80'i32
+          let uDl = uDAll * cfloat(uSc - 32'i32)
           let uQval = cint((uQByte shr qShift) and 3)
-          let uHm = 4 - ((uHmByte shr hmBitPos) and 1) * 4
+          let uHm = 4'i32 - ((uHmByte shr hmBitPos) and 1'i32) * 4'i32
           upAcc = upAcc + uDl * cfloat(uQval - uHm) * xVal
-      fusedElem(sub,       gQb0, uQb0, 0, 0, x0)
-      fusedElem(2 + sub,   gQb0, uQb0, 2, 1, x1)
-      fusedElem(4 + sub,   gQb0, uQb0, 4, 2, x2)
-      fusedElem(6 + sub,   gQb0, uQb0, 6, 3, x3)
-      fusedElem(8 + sub,   gQb1, uQb1, 0, 4, x4)
-      fusedElem(10 + sub,  gQb1, uQb1, 2, 5, x5)
-      fusedElem(12 + sub,  gQb1, uQb1, 4, 6, x6)
-      fusedElem(14 + sub,  gQb1, uQb1, 6, 7, x7)
-      blkIdx = blkIdx + 1
-    # Warp-shuffle reduction for both accumulators
+      fusedElem(sub,            gQb0, uQb0, 0'i32, 0'i32, x0)
+      fusedElem(2'i32 + sub,    gQb0, uQb0, 2'i32, 1'i32, x1)
+      fusedElem(4'i32 + sub,    gQb0, uQb0, 4'i32, 2'i32, x2)
+      fusedElem(6'i32 + sub,    gQb0, uQb0, 6'i32, 3'i32, x3)
+      fusedElem(8'i32 + sub,    gQb1, uQb1, 0'i32, 4'i32, x4)
+      fusedElem(10'i32 + sub,   gQb1, uQb1, 2'i32, 5'i32, x5)
+      fusedElem(12'i32 + sub,   gQb1, uQb1, 4'i32, 6'i32, x6)
+      fusedElem(14'i32 + sub,   gQb1, uQb1, 6'i32, 7'i32, x7)
+      blkIdx = blkIdx + 1'i32
     gateAcc = gateAcc + hippoShflDown(gateAcc, 16)
     gateAcc = gateAcc + hippoShflDown(gateAcc, 8)
     gateAcc = gateAcc + hippoShflDown(gateAcc, 4)
@@ -931,8 +913,7 @@ when HippoWarpSize == 32:
     upAcc = upAcc + hippoShflDown(upAcc, 4)
     upAcc = upAcc + hippoShflDown(upAcc, 2)
     upAcc = upAcc + hippoShflDown(upAcc, 1)
-    # Apply silu(gate) * up in-register and write single result
-    if tid == 0:
+    if tid == 0'i32:
       let g = gateAcc
       let sigmoid = 1.0'f32 / (1.0'f32 + expf(-g))
       outArr[row] = g * sigmoid * upAcc
