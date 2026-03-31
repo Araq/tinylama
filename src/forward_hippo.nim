@@ -19,7 +19,7 @@ const
   HippoBlockSize = 256
   HippoBlockSizeX = 16
   HippoBlockSizeY = 16
-  HippoDecodeRowsPerBlock = 4
+  HippoDecodeRowsPerBlock = 1
   HippoDecodeDotUnroll = 4
   HippoMaxDecodeCols = 5632
 
@@ -386,7 +386,6 @@ proc linearQ2KDecodeKernel(
   xData, outData: ptr float32,
   outRows, wCols: cint
 ) {.hippoGlobal.} =
-  var sx {.hippoShared.}: array[HippoMaxDecodeCols, float32]
   var sdata {.hippoShared.}: array[HippoBlockSize, float32]
   let tid = int(threadIdx.x)
   let blockSize = int(blockDim.x)
@@ -397,13 +396,6 @@ proc linearQ2KDecodeKernel(
   let outArr = cast[ptr UncheckedArray[float32]](outData)
   let nBlocksPerRow = cols div 256
   let rowSizeBytes = nBlocksPerRow * 84
-
-  # Load input vector into shared memory
-  var k = tid
-  while k < cols:
-    sx[k] = xArr[k]
-    k = k + blockSize
-  hippoSyncthreads()
 
   # Pre-compute element mapping — constant across all blocks and rows
   let q2_chunk = tid shr 7
@@ -435,7 +427,7 @@ proc linearQ2KDecodeKernel(
         let dlA = dA * cfloat(scA and 0x0F'u8)
         let mlA = dminA * cfloat(scA shr 4)
         let qvalA = cfloat((w[blkStartA + 16 + q2_qsByteIdx] shr q2_shift) and 3)
-        acc = acc + (dlA * qvalA - mlA) * sx[elemBaseA + tid]
+        acc = acc + (dlA * qvalA - mlA) * xArr[elemBaseA + tid]
 
         # Block B
         let blkStartB = rowBase + (blkIdx + 1) * 84
@@ -448,7 +440,7 @@ proc linearQ2KDecodeKernel(
         let dlB = dB * cfloat(scB and 0x0F'u8)
         let mlB = dminB * cfloat(scB shr 4)
         let qvalB = cfloat((w[blkStartB + 16 + q2_qsByteIdx] shr q2_shift) and 3)
-        acc = acc + (dlB * qvalB - mlB) * sx[elemBaseB + tid]
+        acc = acc + (dlB * qvalB - mlB) * xArr[elemBaseB + tid]
 
         # Block C
         let blkStartC = rowBase + (blkIdx + 2) * 84
@@ -461,7 +453,7 @@ proc linearQ2KDecodeKernel(
         let dlC = dC * cfloat(scC and 0x0F'u8)
         let mlC = dminC * cfloat(scC shr 4)
         let qvalC = cfloat((w[blkStartC + 16 + q2_qsByteIdx] shr q2_shift) and 3)
-        acc = acc + (dlC * qvalC - mlC) * sx[elemBaseC + tid]
+        acc = acc + (dlC * qvalC - mlC) * xArr[elemBaseC + tid]
 
         # Block D
         let blkStartD = rowBase + (blkIdx + 3) * 84
@@ -474,7 +466,7 @@ proc linearQ2KDecodeKernel(
         let dlD = dD * cfloat(scD and 0x0F'u8)
         let mlD = dminD * cfloat(scD shr 4)
         let qvalD = cfloat((w[blkStartD + 16 + q2_qsByteIdx] shr q2_shift) and 3)
-        acc = acc + (dlD * qvalD - mlD) * sx[elemBaseD + tid]
+        acc = acc + (dlD * qvalD - mlD) * xArr[elemBaseD + tid]
 
         blkIdx = blkIdx + 4
 
@@ -490,7 +482,7 @@ proc linearQ2KDecodeKernel(
         let dl = d * cfloat(sc and 0x0F'u8)
         let ml = dmin * cfloat(sc shr 4)
         let qval = cfloat((w[blkStart + 16 + q2_qsByteIdx] shr q2_shift) and 3)
-        acc = acc + (dl * qval - ml) * sx[elemBase + tid]
+        acc = acc + (dl * qval - ml) * xArr[elemBase + tid]
         blkIdx = blkIdx + 1
 
       sdata[tid] = acc
@@ -529,7 +521,6 @@ proc linearQ3KDecodeKernel(
   xData, outData: ptr float32,
   outRows, wCols: cint
 ) {.hippoGlobal.} =
-  var sx {.hippoShared.}: array[HippoMaxDecodeCols, float32]
   var sdata {.hippoShared.}: array[HippoBlockSize, float32]
   let tid = int(threadIdx.x)
   let blockSize = int(blockDim.x)
@@ -540,13 +531,6 @@ proc linearQ3KDecodeKernel(
   let outArr = cast[ptr UncheckedArray[float32]](outData)
   let nBlocksPerRow = cols div 256
   let rowSizeBytes = nBlocksPerRow * 110  # blockQ3KSize = 110
-
-  # Load input vector into shared memory
-  var k = tid
-  while k < cols:
-    sx[k] = xArr[k]
-    k = k + blockSize
-  hippoSyncthreads()
 
   # Pre-compute element mapping — constant across all blocks and rows
   let chunk = tid shr 7              # 0 or 1
@@ -591,7 +575,7 @@ proc linearQ3KDecodeKernel(
         let qvalA = cint((w[blkStartA + 32 + qsByteIdx] shr shift) and 3)
         let hmBitA = (cint(w[blkStartA + hmaskByteOff]) shr hmaskBitPos) and 1
         let hmA = 4 - hmBitA * 4
-        acc = acc + dlA * cfloat(qvalA - hmA) * sx[elemBaseA + tid]
+        acc = acc + dlA * cfloat(qvalA - hmA) * xArr[elemBaseA + tid]
 
         # Block B
         let blkStartB = rowBase + (blkIdx + 1) * 110
@@ -608,7 +592,7 @@ proc linearQ3KDecodeKernel(
         let qvalB = cint((w[blkStartB + 32 + qsByteIdx] shr shift) and 3)
         let hmBitB = (cint(w[blkStartB + hmaskByteOff]) shr hmaskBitPos) and 1
         let hmB = 4 - hmBitB * 4
-        acc = acc + dlB * cfloat(qvalB - hmB) * sx[elemBaseB + tid]
+        acc = acc + dlB * cfloat(qvalB - hmB) * xArr[elemBaseB + tid]
 
         # Block C
         let blkStartC = rowBase + (blkIdx + 2) * 110
@@ -625,7 +609,7 @@ proc linearQ3KDecodeKernel(
         let qvalC = cint((w[blkStartC + 32 + qsByteIdx] shr shift) and 3)
         let hmBitC = (cint(w[blkStartC + hmaskByteOff]) shr hmaskBitPos) and 1
         let hmC = 4 - hmBitC * 4
-        acc = acc + dlC * cfloat(qvalC - hmC) * sx[elemBaseC + tid]
+        acc = acc + dlC * cfloat(qvalC - hmC) * xArr[elemBaseC + tid]
 
         # Block D
         let blkStartD = rowBase + (blkIdx + 3) * 110
@@ -642,7 +626,7 @@ proc linearQ3KDecodeKernel(
         let qvalD = cint((w[blkStartD + 32 + qsByteIdx] shr shift) and 3)
         let hmBitD = (cint(w[blkStartD + hmaskByteOff]) shr hmaskBitPos) and 1
         let hmD = 4 - hmBitD * 4
-        acc = acc + dlD * cfloat(qvalD - hmD) * sx[elemBaseD + tid]
+        acc = acc + dlD * cfloat(qvalD - hmD) * xArr[elemBaseD + tid]
 
         blkIdx = blkIdx + 4
 
@@ -662,7 +646,7 @@ proc linearQ3KDecodeKernel(
         let qval = cint((w[blkStart + 32 + qsByteIdx] shr shift) and 3)
         let hmBit = (cint(w[blkStart + hmaskByteOff]) shr hmaskBitPos) and 1
         let hm = 4 - hmBit * 4
-        acc = acc + dl * cfloat(qval - hm) * sx[elemBase + tid]
+        acc = acc + dl * cfloat(qval - hm) * xArr[elemBase + tid]
         blkIdx = blkIdx + 1
 
       sdata[tid] = acc
@@ -1274,7 +1258,6 @@ proc linearHippoDecodeKernel(
   wData, xData, outData: ptr float32,
   outRows, wCols: cint
 ) {.hippoGlobal.} =
-  var sx {.hippoShared.}: array[HippoMaxDecodeCols, float32]
   var sdata {.hippoShared.}: array[HippoBlockSize, float32]
   let tid = int(threadIdx.x)
   let blockSize = int(blockDim.x)
@@ -1285,30 +1268,24 @@ proc linearHippoDecodeKernel(
   let xArray = cast[ptr UncheckedArray[float32]](xData)
   let outArray = cast[ptr UncheckedArray[float32]](outData)
 
-  var k = tid
-  while k < cols:
-    sx[k] = xArray[k]
-    k = k + blockSize
-  hippoSyncthreads()
-
   for r in 0 ..< HippoDecodeRowsPerBlock:
     let outRow = baseRow + r
 
     if outRow < int(outRows):
       let rowBase = outRow * cols
       var acc = 0.0'f32
-      k = tid
+      var k = tid
       while k + (HippoDecodeDotUnroll - 1) * blockSize < cols:
         let k1 = k + blockSize
         let k2 = k1 + blockSize
         let k3 = k2 + blockSize
-        acc = acc + wArray[rowBase + k] * sx[k]
-        acc = acc + wArray[rowBase + k1] * sx[k1]
-        acc = acc + wArray[rowBase + k2] * sx[k2]
-        acc = acc + wArray[rowBase + k3] * sx[k3]
+        acc = acc + wArray[rowBase + k] * xArray[k]
+        acc = acc + wArray[rowBase + k1] * xArray[k1]
+        acc = acc + wArray[rowBase + k2] * xArray[k2]
+        acc = acc + wArray[rowBase + k3] * xArray[k3]
         k = k + unrollSpan
       while k < cols:
-        acc = acc + wArray[rowBase + k] * sx[k]
+        acc = acc + wArray[rowBase + k] * xArray[k]
         k = k + blockSize
       sdata[tid] = acc
     else:
