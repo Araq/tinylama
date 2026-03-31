@@ -1,6 +1,6 @@
 ## Shared types for the forward pass, used by all backends.
 
-import ./[model, tensor]
+import ./tensor
 
 when defined(useHippo):
   import ./forward_hippo_types
