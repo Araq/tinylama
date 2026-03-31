@@ -271,9 +271,11 @@ type
     outputWeightQ*: pointer  # quantized output weight (nil if float32)
     outputQType*: int32
     outputShape0*, outputShape1*: int
+    ropeTheta*: pointer      # precomputed theta[i] = (1/base)^(2i/dim), on GPU
     initialized*: bool
 
 var modelPtrs*: ModelGpuPtrs
+var ropeThetaAlloc: HippoAllocRef  # prevent GC of theta table
 
 proc gpuUploadToDevice*(dst: pointer, src: pointer, bytes: int, stream: HippoStream) =
   ## Upload host data to existing device pointer.
@@ -1246,6 +1248,19 @@ proc ensureModelGpuPtrs*(m: var Model, hp: HParams) =
     modelPtrs.outputWeightQ = nil
     modelPtrs.outputQType = 0
 
+  # Precompute RoPE theta table: theta[i] = (1/base)^(2i/dim)
+  let ropeDim = hp.ropeDim
+  let halfRope = ropeDim div 2
+  var thetaBuf = newSeq[float32](halfRope)
+  for i in 0 ..< halfRope:
+    thetaBuf[i] = pow(1.0'f32 / hp.ropeFreqBase, (2.0'f32 * i.float32) / ropeDim.float32)
+  ropeThetaAlloc = hippoMalloc(halfRope * sizeof(float32))
+  let stream = gpuCtx.stream
+  hippoMemcpyAsync(ropeThetaAlloc.p, addr thetaBuf[0], halfRope * sizeof(float32),
+                    HippoMemcpyHostToDevice, stream)
+  gpuStreamSync(stream)
+  modelPtrs.ropeTheta = ropeThetaAlloc.p
+
   modelPtrs.initialized = true
 
 # ---------------------------------------------------------------------------
@@ -1509,28 +1524,27 @@ proc ropeAtPosKernel(
       x[idx1] = v0 * ps + v1 * pc
       p = p + 1
 
-# Fused RoPE for Q and K decode (seqLen=1)
+# Fused RoPE for Q and K decode (seqLen=1) with precomputed theta table
 proc ropeQKDecodeKernel(
   qData, kData: ptr float32,
-  nHeadQ, nHeadK, headDim, ropeDim: cint,
-  ropeBase: float32, pos: cint
+  thetaData: ptr float32,
+  nHeadQ, nHeadK, headDim, halfRope: cint,
+  pos: cint
 ) {.hippoGlobal.} =
   let idx = cint(blockIdx.x * blockDim.x + threadIdx.x)
-  let halfRope = ropeDim div 2'i32
   let qPairs = nHeadQ * halfRope
   let totalPairs = qPairs + nHeadK * halfRope
   if idx >= totalPairs:
     return
+  let thetaArr = cast[ptr UncheckedArray[float32]](thetaData)
   let isK = idx >= qPairs
   let localIdx = if isK: idx - qPairs else: idx
-  let nHead = if isK: nHeadK else: nHeadQ
   let x = if isK: cast[ptr UncheckedArray[float32]](kData)
           else: cast[ptr UncheckedArray[float32]](qData)
   let h = localIdx div halfRope
   let i = localIdx mod halfRope
   let hOffset = h * headDim
-  let theta = powf(1.0'f32 / cfloat(ropeBase), cfloat(2'i32 * i) / cfloat(ropeDim))
-  let angle = cfloat(pos) * theta
+  let angle = cfloat(pos) * thetaArr[i]
   let c = cosf(angle)
   let s = sinf(angle)
   let idx0 = hOffset + 2'i32 * i
@@ -1547,12 +1561,13 @@ proc gpuRopeQKDecode*(q, k: pointer, nHeadQ, nHeadK, headDim, ropeDim: int,
   let grid = newDim3(((totalPairs + HippoBlockSize - 1) div HippoBlockSize).uint32)
   let blk = newDim3(HippoBlockSize.uint32)
   var qPtr = q; var kPtr = k
+  var thetaPtr = modelPtrs.ropeTheta
   var nHQ = nHeadQ.cint; var nHK = nHeadK.cint
-  var hdArg = headDim.cint; var rdArg = ropeDim.cint
-  var rbArg = ropeBase; var posArg = pos.cint
+  var hdArg = headDim.cint; var hrArg = halfRope.cint
+  var posArg = pos.cint
   hippoLaunchKernel(ropeQKDecodeKernel, gridDim = grid, blockDim = blk,
                     stream = stream,
-                    args = hippoArgs(qPtr, kPtr, nHQ, nHK, hdArg, rdArg, rbArg, posArg))
+                    args = hippoArgs(qPtr, kPtr, thetaPtr, nHQ, nHK, hdArg, hrArg, posArg))
 
 proc gpuRopeAtPos*(x: pointer, nHead, headDim, ropeDim: int,
                     ropeBase: float32, pos: int, seqLen: int,
