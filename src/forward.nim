@@ -480,8 +480,9 @@ when defined(useHippo):
       when defined(profileHippo):
         recordStop(eventPairs, stream)
         recordStart(eventPairs, KcKvStore, stream)
-      gpuStoreKV(cache.gpuCache.k[layer].devicePtr, tmp1, kvDim, 1, cache.gpuCache.maxLen, pos, stream)
-      gpuStoreKV(cache.gpuCache.v[layer].devicePtr, tmp2, kvDim, 1, cache.gpuCache.maxLen, pos, stream)
+      gpuStoreKVPair(cache.gpuCache.k[layer].devicePtr, tmp1,
+                      cache.gpuCache.v[layer].devicePtr, tmp2,
+                      kvDim, 1, cache.gpuCache.maxLen, pos, stream)
       when defined(profileHippo):
         recordStop(eventPairs, stream)
         recordStart(eventPairs, KcAttention, stream)

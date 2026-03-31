@@ -1397,6 +1397,7 @@ proc gpuRopeAtPos*(x: pointer, nHead, headDim, ropeDim: int,
                     args = hippoArgs(xPtr, nHeadArg, headDimArg, ropeDimArg,
                                      ropeBaseArg, posArg, seqLenArg))
 
+
 # ---------------------------------------------------------------------------
 # Kernel: Store KV (write k,v vectors into KV cache)
 # ---------------------------------------------------------------------------
@@ -1429,6 +1430,39 @@ proc gpuStoreKV*(cache: pointer, src: pointer,
                     stream = stream,
                     args = hippoArgs(cPtr, sPtr, rowsArg, srcColsArg,
                                      cacheColsArg, startPosArg))
+
+# Fused KV store: writes both K and V in a single launch
+proc storeKVPairKernel(
+  kCacheData, kSrcData, vCacheData, vSrcData: ptr float32,
+  rows, srcCols, cacheCols, startPos: cint
+) {.hippoGlobal.} =
+  let idx = cint(blockIdx.x * blockDim.x + threadIdx.x)
+  let totalPerKV = rows * srcCols
+  if idx >= totalPerKV * 2'i32:
+    return
+  let isV = idx >= totalPerKV
+  let localIdx = if isV: idx - totalPerKV else: idx
+  let cache = if isV: cast[ptr UncheckedArray[float32]](vCacheData)
+              else: cast[ptr UncheckedArray[float32]](kCacheData)
+  let src = if isV: cast[ptr UncheckedArray[float32]](vSrcData)
+            else: cast[ptr UncheckedArray[float32]](kSrcData)
+  let r = localIdx div srcCols
+  let c = localIdx mod srcCols
+  cache[r * cacheCols + startPos + c] = src[r * srcCols + c]
+
+proc gpuStoreKVPair*(kCache, kSrc, vCache, vSrc: pointer,
+                      rows, srcCols, cacheCols, startPos: int,
+                      stream: HippoStream) =
+  let totalBoth = rows * srcCols * 2
+  let grid = newDim3(((totalBoth + HippoBlockSize - 1) div HippoBlockSize).uint32)
+  let blk = newDim3(HippoBlockSize.uint32)
+  var kcPtr = kCache; var ksPtr = kSrc; var vcPtr = vCache; var vsPtr = vSrc
+  var rowsArg = rows.cint; var srcColsArg = srcCols.cint
+  var cacheColsArg = cacheCols.cint; var startPosArg = startPos.cint
+  hippoLaunchKernel(storeKVPairKernel, gridDim = grid, blockDim = blk,
+                    stream = stream,
+                    args = hippoArgs(kcPtr, ksPtr, vcPtr, vsPtr, rowsArg,
+                                     srcColsArg, cacheColsArg, startPosArg))
 
 # ---------------------------------------------------------------------------
 # Kernel: Attention decode (single-token, cached KV)
