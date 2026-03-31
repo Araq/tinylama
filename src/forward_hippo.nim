@@ -814,6 +814,137 @@ proc gpuLinearColQ3K*(dst, x, wQuant: pointer, wCols, wRows: int,
                       args = hippoArgs(wPtr, xPtr, dPtr, outRowsArg, wColsArg))
 
 # ---------------------------------------------------------------------------
+# Fused K(Q2K)+V(Q3K) GEMV decode — single kernel launch, shared input reads
+# ---------------------------------------------------------------------------
+when HippoWarpSize == 32:
+  proc fusedKVQ2KQ3KWarpKernel(
+    kData, vData: ptr uint8,
+    xData, kOut, vOut: ptr float32,
+    outRows, wCols: cint
+  ) {.hippoGlobal.} =
+    ## Fused K(Q2K)+V(Q3K) warp-per-row GEMV: reads input once, dual accumulators.
+    let tid = cint(threadIdx.x)
+    let row = cint(blockIdx.x)
+    if row >= outRows:
+      return
+    let kw = cast[ptr UncheckedArray[uint8]](kData)
+    let vw = cast[ptr UncheckedArray[uint8]](vData)
+    let xArr = cast[ptr UncheckedArray[float32]](xData)
+    let kArr = cast[ptr UncheckedArray[float32]](kOut)
+    let vArr = cast[ptr UncheckedArray[float32]](vOut)
+    let nBlocksPerRow = wCols div 256'i32
+    let kRowSizeBytes = nBlocksPerRow * 84'i32
+    let vRowSizeBytes = nBlocksPerRow * 110'i32
+    let kRowBase = row * kRowSizeBytes
+    let vRowBase = row * vRowSizeBytes
+    let sub = (tid shr 4'i32) and 1'i32
+    # Q2K offsets
+    let kQsOff0 = 16'i32 + sub * 16'i32 + (tid and 15'i32)
+    let kQsOff1 = 48'i32 + sub * 16'i32 + (tid and 15'i32)
+    # Q3K offsets
+    let vQsOff0 = 32'i32 + sub * 16'i32 + (tid and 15'i32)
+    let vQsOff1 = 64'i32 + sub * 16'i32 + (tid and 15'i32)
+    let vHmOff = sub * 16'i32 + (tid and 15'i32)
+    var kAcc = 0.0'f32
+    var vAcc = 0.0'f32
+    var blkIdx = 0'i32
+    while blkIdx < nBlocksPerRow:
+      let kbs = kRowBase + blkIdx * 84'i32
+      let vbs = vRowBase + blkIdx * 110'i32
+      let eb = blkIdx * 256'i32
+      # Load shared input values once
+      let x0 = xArr[eb + tid]
+      let x1 = xArr[eb + tid + 32'i32]
+      let x2 = xArr[eb + tid + 64'i32]
+      let x3 = xArr[eb + tid + 96'i32]
+      let x4 = xArr[eb + tid + 128'i32]
+      let x5 = xArr[eb + tid + 160'i32]
+      let x6 = xArr[eb + tid + 192'i32]
+      let x7 = xArr[eb + tid + 224'i32]
+      # --- Q2K dequant for K ---
+      let kDRaw = uint16(kw[kbs + 80'i32]) or (uint16(kw[kbs + 81'i32]) shl 8)
+      let kDmRaw = uint16(kw[kbs + 82'i32]) or (uint16(kw[kbs + 83'i32]) shl 8)
+      let kD = hippoHalfToFloat(kDRaw)
+      let kDm = hippoHalfToFloat(kDmRaw)
+      let kQb0 = kw[kbs + kQsOff0]
+      let kQb1 = kw[kbs + kQsOff1]
+      let kSc0 = kw[kbs + sub]
+      kAcc = kAcc + (kD * cfloat(kSc0 and 0x0F) * cfloat(kQb0 and 3) - kDm * cfloat(kSc0 shr 4)) * x0
+      let kSc1 = kw[kbs + 2'i32 + sub]
+      kAcc = kAcc + (kD * cfloat(kSc1 and 0x0F) * cfloat((kQb0 shr 2) and 3) - kDm * cfloat(kSc1 shr 4)) * x1
+      let kSc2 = kw[kbs + 4'i32 + sub]
+      kAcc = kAcc + (kD * cfloat(kSc2 and 0x0F) * cfloat((kQb0 shr 4) and 3) - kDm * cfloat(kSc2 shr 4)) * x2
+      let kSc3 = kw[kbs + 6'i32 + sub]
+      kAcc = kAcc + (kD * cfloat(kSc3 and 0x0F) * cfloat((kQb0 shr 6) and 3) - kDm * cfloat(kSc3 shr 4)) * x3
+      let kSc4 = kw[kbs + 8'i32 + sub]
+      kAcc = kAcc + (kD * cfloat(kSc4 and 0x0F) * cfloat(kQb1 and 3) - kDm * cfloat(kSc4 shr 4)) * x4
+      let kSc5 = kw[kbs + 10'i32 + sub]
+      kAcc = kAcc + (kD * cfloat(kSc5 and 0x0F) * cfloat((kQb1 shr 2) and 3) - kDm * cfloat(kSc5 shr 4)) * x5
+      let kSc6 = kw[kbs + 12'i32 + sub]
+      kAcc = kAcc + (kD * cfloat(kSc6 and 0x0F) * cfloat((kQb1 shr 4) and 3) - kDm * cfloat(kSc6 shr 4)) * x6
+      let kSc7 = kw[kbs + 14'i32 + sub]
+      kAcc = kAcc + (kD * cfloat(kSc7 and 0x0F) * cfloat((kQb1 shr 6) and 3) - kDm * cfloat(kSc7 shr 4)) * x7
+      # --- Q3K dequant for V ---
+      let vDRaw = uint16(vw[vbs + 108'i32]) or (uint16(vw[vbs + 109'i32]) shl 8)
+      let vDAll = hippoHalfToFloat(vDRaw)
+      let vQb0 = vw[vbs + vQsOff0]
+      let vQb1 = vw[vbs + vQsOff1]
+      let vHmByte = cint(vw[vbs + vHmOff])
+      template fusedQ3KElem(scaleIdx: cint, qByte: untyped, qShift, hmBitPos: cint, xVal: float32) {.dirty.} =
+        block:
+          let si = scaleIdx
+          let big = si and 3'i32
+          let ai = si shr 2'i32
+          let sByteVal = cint(vw[vbs + 96'i32 + (ai and 1'i32) * 4'i32 + big])
+          let tByteVal = cint(vw[vbs + 104'i32 + big])
+          let low = (sByteVal shr ((ai shr 1'i32) * 4'i32)) and 0x0F'i32
+          let high = ((tByteVal shr (ai * 2'i32)) and 0x03'i32) shl 4'i32
+          let scByte = low or high
+          let scSigned = (scByte xor 0x80'i32) - 0x80'i32
+          let dl = vDAll * cfloat(scSigned - 32'i32)
+          let qval = cint((qByte shr qShift) and 3)
+          let hm = 4'i32 - ((vHmByte shr hmBitPos) and 1'i32) * 4'i32
+          vAcc = vAcc + dl * cfloat(qval - hm) * xVal
+      fusedQ3KElem(sub,            vQb0, 0'i32, 0'i32, x0)
+      fusedQ3KElem(2'i32 + sub,    vQb0, 2'i32, 1'i32, x1)
+      fusedQ3KElem(4'i32 + sub,    vQb0, 4'i32, 2'i32, x2)
+      fusedQ3KElem(6'i32 + sub,    vQb0, 6'i32, 3'i32, x3)
+      fusedQ3KElem(8'i32 + sub,    vQb1, 0'i32, 4'i32, x4)
+      fusedQ3KElem(10'i32 + sub,   vQb1, 2'i32, 5'i32, x5)
+      fusedQ3KElem(12'i32 + sub,   vQb1, 4'i32, 6'i32, x6)
+      fusedQ3KElem(14'i32 + sub,   vQb1, 6'i32, 7'i32, x7)
+      blkIdx = blkIdx + 1'i32
+    # Warp-shuffle reduce K
+    kAcc = kAcc + hippoShflDown(kAcc, 16)
+    kAcc = kAcc + hippoShflDown(kAcc, 8)
+    kAcc = kAcc + hippoShflDown(kAcc, 4)
+    kAcc = kAcc + hippoShflDown(kAcc, 2)
+    kAcc = kAcc + hippoShflDown(kAcc, 1)
+    # Warp-shuffle reduce V
+    vAcc = vAcc + hippoShflDown(vAcc, 16)
+    vAcc = vAcc + hippoShflDown(vAcc, 8)
+    vAcc = vAcc + hippoShflDown(vAcc, 4)
+    vAcc = vAcc + hippoShflDown(vAcc, 2)
+    vAcc = vAcc + hippoShflDown(vAcc, 1)
+    if tid == 0'i32:
+      kArr[row] = kAcc
+      vArr[row] = vAcc
+
+proc gpuFusedKVLinearQ2KQ3K*(kDst, vDst, x, kQuant, vQuant: pointer,
+                              wCols, wRows: int, stream: HippoStream) =
+  when HippoWarpSize == 32:
+    let grid = newDim3(wRows.uint32)
+    let blk = newDim3(HippoWarpSize.uint32)
+    var kPtr = kQuant; var vPtr = vQuant
+    var xPtr = x; var kDstP = kDst; var vDstP = vDst
+    var outRowsArg = wRows.cint; var wColsArg = wCols.cint
+    hippoLaunchKernel(fusedKVQ2KQ3KWarpKernel, gridDim = grid, blockDim = blk,
+                      stream = stream,
+                      args = hippoArgs(kPtr, vPtr, xPtr, kDstP, vDstP, outRowsArg, wColsArg))
+  else:
+    {.error: "gpuFusedKVLinearQ2KQ3K requires WarpSize == 32".}
+
+# ---------------------------------------------------------------------------
 # Q6_K GEMV decode (warp-per-row, WarpSize==32 only)
 # ---------------------------------------------------------------------------
 when HippoWarpSize == 32:
