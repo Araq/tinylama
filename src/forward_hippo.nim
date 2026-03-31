@@ -26,6 +26,150 @@ const
 when HippoDecodeDotUnroll != 4:
   {.error: "linearHippoDecodeKernel currently implements a fixed 4-way unroll.".}
 
+template reduceSum256(sdata: var array[HippoBlockSize, float32], tid: int) =
+  ## 256-thread tree reduction with warp shuffle for the final intra-warp steps.
+  when HippoBlockSize == 256:
+    if tid < 128:
+      sdata[tid] = sdata[tid] + sdata[tid + 128]
+    hippoSyncthreads()
+    when HippoWarpSize == 64:
+      if tid < 64:
+        sdata[tid] = sdata[tid] + sdata[tid + 64]
+      hippoSyncthreads()
+      if tid < HippoWarpSize:
+        var val = sdata[tid]
+        val = val + hippoShflDown(val, 32)
+        val = val + hippoShflDown(val, 16)
+        val = val + hippoShflDown(val, 8)
+        val = val + hippoShflDown(val, 4)
+        val = val + hippoShflDown(val, 2)
+        val = val + hippoShflDown(val, 1)
+        if tid == 0:
+          sdata[0] = val
+      hippoSyncthreads()
+    elif HippoWarpSize == 32:
+      if tid < 64:
+        sdata[tid] = sdata[tid] + sdata[tid + 64]
+      hippoSyncthreads()
+      if tid < 32:
+        sdata[tid] = sdata[tid] + sdata[tid + 32]
+      hippoSyncthreads()
+      if tid < HippoWarpSize:
+        var val = sdata[tid]
+        val = val + hippoShflDown(val, 16)
+        val = val + hippoShflDown(val, 8)
+        val = val + hippoShflDown(val, 4)
+        val = val + hippoShflDown(val, 2)
+        val = val + hippoShflDown(val, 1)
+        if tid == 0:
+          sdata[0] = val
+      hippoSyncthreads()
+    else:
+      if tid < 64:
+        sdata[tid] = sdata[tid] + sdata[tid + 64]
+      hippoSyncthreads()
+      if tid < 32:
+        sdata[tid] = sdata[tid] + sdata[tid + 32]
+      hippoSyncthreads()
+      if tid < 16:
+        sdata[tid] = sdata[tid] + sdata[tid + 16]
+      hippoSyncthreads()
+      if tid < 8:
+        sdata[tid] = sdata[tid] + sdata[tid + 8]
+      hippoSyncthreads()
+      if tid < 4:
+        sdata[tid] = sdata[tid] + sdata[tid + 4]
+      hippoSyncthreads()
+      if tid < 2:
+        sdata[tid] = sdata[tid] + sdata[tid + 2]
+      hippoSyncthreads()
+      if tid < 1:
+        sdata[tid] = sdata[tid] + sdata[tid + 1]
+      hippoSyncthreads()
+
+template reduceMax256(sdata: var array[HippoBlockSize, float32], tid: int) =
+  ## 256-thread tree max-reduction with warp shuffle for the final intra-warp steps.
+  when HippoBlockSize == 256:
+    if tid < 128:
+      if sdata[tid + 128] > sdata[tid]:
+        sdata[tid] = sdata[tid + 128]
+    hippoSyncthreads()
+    when HippoWarpSize == 64:
+      if tid < 64:
+        if sdata[tid + 64] > sdata[tid]:
+          sdata[tid] = sdata[tid + 64]
+      hippoSyncthreads()
+      if tid < HippoWarpSize:
+        var val = sdata[tid]
+        var other = hippoShflDown(val, 32)
+        if other > val: val = other
+        other = hippoShflDown(val, 16)
+        if other > val: val = other
+        other = hippoShflDown(val, 8)
+        if other > val: val = other
+        other = hippoShflDown(val, 4)
+        if other > val: val = other
+        other = hippoShflDown(val, 2)
+        if other > val: val = other
+        other = hippoShflDown(val, 1)
+        if other > val: val = other
+        if tid == 0:
+          sdata[0] = val
+      hippoSyncthreads()
+    elif HippoWarpSize == 32:
+      if tid < 64:
+        if sdata[tid + 64] > sdata[tid]:
+          sdata[tid] = sdata[tid + 64]
+      hippoSyncthreads()
+      if tid < 32:
+        if sdata[tid + 32] > sdata[tid]:
+          sdata[tid] = sdata[tid + 32]
+      hippoSyncthreads()
+      if tid < HippoWarpSize:
+        var val = sdata[tid]
+        var other = hippoShflDown(val, 16)
+        if other > val: val = other
+        other = hippoShflDown(val, 8)
+        if other > val: val = other
+        other = hippoShflDown(val, 4)
+        if other > val: val = other
+        other = hippoShflDown(val, 2)
+        if other > val: val = other
+        other = hippoShflDown(val, 1)
+        if other > val: val = other
+        if tid == 0:
+          sdata[0] = val
+      hippoSyncthreads()
+    else:
+      if tid < 64:
+        if sdata[tid + 64] > sdata[tid]:
+          sdata[tid] = sdata[tid + 64]
+      hippoSyncthreads()
+      if tid < 32:
+        if sdata[tid + 32] > sdata[tid]:
+          sdata[tid] = sdata[tid + 32]
+      hippoSyncthreads()
+      if tid < 16:
+        if sdata[tid + 16] > sdata[tid]:
+          sdata[tid] = sdata[tid + 16]
+      hippoSyncthreads()
+      if tid < 8:
+        if sdata[tid + 8] > sdata[tid]:
+          sdata[tid] = sdata[tid + 8]
+      hippoSyncthreads()
+      if tid < 4:
+        if sdata[tid + 4] > sdata[tid]:
+          sdata[tid] = sdata[tid + 4]
+      hippoSyncthreads()
+      if tid < 2:
+        if sdata[tid + 2] > sdata[tid]:
+          sdata[tid] = sdata[tid + 2]
+      hippoSyncthreads()
+      if tid < 1:
+        if sdata[tid + 1] > sdata[tid]:
+          sdata[tid] = sdata[tid + 1]
+      hippoSyncthreads()
+
 type
   HippoAllocRef* = type(hippoMalloc(1))
 
@@ -354,39 +498,7 @@ proc linearQ2KDecodeKernel(
       sdata[tid] = 0.0'f32
     hippoSyncthreads()
 
-    # 256-thread tree reduction (same as float32 kernel)
-    when HippoBlockSize == 256:
-      if tid < 128:
-        sdata[tid] = sdata[tid] + sdata[tid + 128]
-      hippoSyncthreads()
-      if tid < 64:
-        sdata[tid] = sdata[tid] + sdata[tid + 64]
-      hippoSyncthreads()
-      if tid < 32:
-        sdata[tid] = sdata[tid] + sdata[tid + 32]
-      hippoSyncthreads()
-      if tid < 16:
-        sdata[tid] = sdata[tid] + sdata[tid + 16]
-      hippoSyncthreads()
-      if tid < 8:
-        sdata[tid] = sdata[tid] + sdata[tid + 8]
-      hippoSyncthreads()
-      if tid < 4:
-        sdata[tid] = sdata[tid] + sdata[tid + 4]
-      hippoSyncthreads()
-      if tid < 2:
-        sdata[tid] = sdata[tid] + sdata[tid + 2]
-      hippoSyncthreads()
-      if tid < 1:
-        sdata[tid] = sdata[tid] + sdata[tid + 1]
-      hippoSyncthreads()
-    else:
-      var stride = blockSize div 2
-      while stride > 0:
-        if tid < stride:
-          sdata[tid] = sdata[tid] + sdata[tid + stride]
-        hippoSyncthreads()
-        stride = stride div 2
+    reduceSum256(sdata, tid)
 
     if tid == 0 and outRow < int(outRows):
       outArr[outRow] = sdata[0]
@@ -558,39 +670,7 @@ proc linearQ3KDecodeKernel(
       sdata[tid] = 0.0'f32
     hippoSyncthreads()
 
-    # 256-thread tree reduction
-    when HippoBlockSize == 256:
-      if tid < 128:
-        sdata[tid] = sdata[tid] + sdata[tid + 128]
-      hippoSyncthreads()
-      if tid < 64:
-        sdata[tid] = sdata[tid] + sdata[tid + 64]
-      hippoSyncthreads()
-      if tid < 32:
-        sdata[tid] = sdata[tid] + sdata[tid + 32]
-      hippoSyncthreads()
-      if tid < 16:
-        sdata[tid] = sdata[tid] + sdata[tid + 16]
-      hippoSyncthreads()
-      if tid < 8:
-        sdata[tid] = sdata[tid] + sdata[tid + 8]
-      hippoSyncthreads()
-      if tid < 4:
-        sdata[tid] = sdata[tid] + sdata[tid + 4]
-      hippoSyncthreads()
-      if tid < 2:
-        sdata[tid] = sdata[tid] + sdata[tid + 2]
-      hippoSyncthreads()
-      if tid < 1:
-        sdata[tid] = sdata[tid] + sdata[tid + 1]
-      hippoSyncthreads()
-    else:
-      var stride = blockSize div 2
-      while stride > 0:
-        if tid < stride:
-          sdata[tid] = sdata[tid] + sdata[tid + stride]
-        hippoSyncthreads()
-        stride = stride div 2
+    reduceSum256(sdata, tid)
 
     if tid == 0 and outRow < int(outRows):
       outArr[outRow] = sdata[0]
@@ -793,13 +873,7 @@ proc rmsnormColsKernel(
   sdata[tid] = ss
   hippoSyncthreads()
 
-  # Tree reduction in shared memory
-  var stride = int(blockDim.x) div 2
-  while stride > 0:
-    if tid < stride:
-      sdata[tid] = sdata[tid] + sdata[tid + stride]
-    hippoSyncthreads()
-    stride = stride div 2
+  reduceSum256(sdata, tid)
 
   # Broadcast inv
   var inv {.hippoShared.}: array[1, float32]
@@ -1014,14 +1088,7 @@ proc attentionDecodeKernel(
   hippoSyncthreads()
 
   # Reduce max across threads
-  var stride = int(blockDim.x) div 2
-  while stride > 0:
-    if tid < stride:
-      if sMax[tid + stride] > sMax[tid]:
-        sMax[tid] = sMax[tid + stride]
-    hippoSyncthreads()
-    stride = stride div 2
-
+  reduceMax256(sMax, tid)
   let globalMax = sMax[0]
 
   # Exp and partial sum
@@ -1036,13 +1103,7 @@ proc attentionDecodeKernel(
   hippoSyncthreads()
 
   # Reduce sum
-  stride = int(blockDim.x) div 2
-  while stride > 0:
-    if tid < stride:
-      sSum[tid] = sSum[tid] + sSum[tid + stride]
-    hippoSyncthreads()
-    stride = stride div 2
-
+  reduceSum256(sSum, tid)
   let invSum = 1.0'f32 / sSum[0]
 
   # Normalize scores
@@ -1132,14 +1193,7 @@ proc attentionPrefillKernel(
   sMax[tid] = localMax
   hippoSyncthreads()
 
-  var stride = int(blockDim.x) div 2
-  while stride > 0:
-    if tid < stride:
-      if sMax[tid + stride] > sMax[tid]:
-        sMax[tid] = sMax[tid + stride]
-    hippoSyncthreads()
-    stride = stride div 2
-
+  reduceMax256(sMax, tid)
   let globalMax = sMax[0]
 
   var localSum = 0.0'f32
@@ -1152,13 +1206,7 @@ proc attentionPrefillKernel(
   sSum[tid] = localSum
   hippoSyncthreads()
 
-  stride = int(blockDim.x) div 2
-  while stride > 0:
-    if tid < stride:
-      sSum[tid] = sSum[tid] + sSum[tid + stride]
-    hippoSyncthreads()
-    stride = stride div 2
-
+  reduceSum256(sSum, tid)
   let invSum = 1.0'f32 / sSum[0]
 
   j = tid
@@ -1267,38 +1315,7 @@ proc linearHippoDecodeKernel(
       sdata[tid] = 0.0'f32
     hippoSyncthreads()
 
-    when HippoBlockSize == 256:
-      if tid < 128:
-        sdata[tid] = sdata[tid] + sdata[tid + 128]
-      hippoSyncthreads()
-      if tid < 64:
-        sdata[tid] = sdata[tid] + sdata[tid + 64]
-      hippoSyncthreads()
-      if tid < 32:
-        sdata[tid] = sdata[tid] + sdata[tid + 32]
-      hippoSyncthreads()
-      if tid < 16:
-        sdata[tid] = sdata[tid] + sdata[tid + 16]
-      hippoSyncthreads()
-      if tid < 8:
-        sdata[tid] = sdata[tid] + sdata[tid + 8]
-      hippoSyncthreads()
-      if tid < 4:
-        sdata[tid] = sdata[tid] + sdata[tid + 4]
-      hippoSyncthreads()
-      if tid < 2:
-        sdata[tid] = sdata[tid] + sdata[tid + 2]
-      hippoSyncthreads()
-      if tid < 1:
-        sdata[tid] = sdata[tid] + sdata[tid + 1]
-      hippoSyncthreads()
-    else:
-      var stride = blockSize div 2
-      while stride > 0:
-        if tid < stride:
-          sdata[tid] = sdata[tid] + sdata[tid + stride]
-        hippoSyncthreads()
-        stride = stride div 2
+    reduceSum256(sdata, tid)
 
     if tid == 0 and outRow < int(outRows):
       outArray[outRow] = sdata[0]
