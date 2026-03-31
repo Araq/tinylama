@@ -74,8 +74,8 @@ nim c -r -d:release bench/bench_tinylama.nim \
   models/TinyLlama-1.1B-Chat-v1.0.Q2_K.gguf
 ```
 
-The benchmark prints a decode summary with best/mean `ms/token` and `tok/s`.
-Defaults: 32 decode steps, 2 warmup runs, 8 sample runs.
+The benchmark prints decode throughput as `avg tok/s ± stdev` (matching llama-bench).
+Defaults: 128 decode steps, 1 warmup run, 5 sample runs.
 Override with `--decode-steps N`, `--decode-warmup N`, `--decode-runs N`.
 
 Optional Malebolgia parallel run:

@@ -5,7 +5,7 @@
 ##   nim c -r -d:release bench/bench_tinylama.nim models/model.gguf --decode-steps 32 --decode-warmup 2 --decode-runs 8
 
 import
-  std/[monotimes, os, strformat, strutils],
+  std/[math, monotimes, os, strformat, strutils],
   benchy,
   ../src/[forward, gguf_loader, infer_core, model, tensor, tokenizer]
 
@@ -17,9 +17,9 @@ const
   LongPrompt =
     "Explain transformers in simple terms, then give a compact example " &
     "of how token-by-token decoding works."
-  DefaultDecodeSteps = 32
-  DefaultDecodeWarmup = 2
-  DefaultDecodeRuns = 8
+  DefaultDecodeSteps = 128
+  DefaultDecodeWarmup = 1
+  DefaultDecodeRuns = 5
 
   # Reference output for Q2_K model with ShortPrompt, 8 decode steps.
   # "\nNimi is a small town in the"
@@ -28,23 +28,21 @@ const
     29940'i32, 10233, 338, 263, 2319, 4726, 297, 278
   ]
 
-proc nowMs(): float64 =
-  ## Return the current monotonic time in milliseconds.
-  getMonoTime().ticks.float64 / 1_000_000.0
-
-proc minValue(values: seq[float64]): float64 =
-  ## Return the minimum value from a non-empty float sequence.
-  result = values[0]
-  for i in 1 ..< values.len:
-    if values[i] < result:
-      result = values[i]
-
 proc meanValue(values: seq[float64]): float64 =
   ## Return the arithmetic mean from a non-empty float sequence.
   var total = 0.0
   for value in values:
     total += value
   result = total / values.len.float64
+
+proc stdevValue(values: seq[float64]): float64 =
+  ## Sample standard deviation (Bessel-corrected), matching llama-bench.
+  if values.len <= 1: return 0.0
+  let mean = meanValue(values)
+  var sqSum = 0.0
+  for v in values: sqSum += v * v
+  let n = values.len.float64
+  result = sqrt(sqSum / (n - 1.0) - mean * mean * n / (n - 1.0))
 
 proc parsePositiveInt(value, flagName: string): int =
   ## Parse an integer CLI value and ensure it is at least 1.
@@ -98,29 +96,27 @@ proc measureDecodeSamples(
   firstGenerated: int32,
   nVocab, decodeSteps, decodeRuns: int
 ): seq[float64] =
-  ## Measure steady-state decode timings with one full decode run per sample.
+  ## Measure decode tok/s per sample (cache clone excluded from timing).
   result = newSeq[float64](decodeRuns)
   for i in 0 ..< decodeRuns:
-    let startMs = nowMs()
-    discard runDecodeSteps(m, decodeBase, firstGenerated, nVocab, decodeSteps)
-    result[i] = nowMs() - startMs
+    var cache = cloneCache(decodeBase)
+    var next = firstGenerated
+    let startNs = getMonoTime().ticks
+    for j in 0 ..< decodeSteps:
+      let logits = forwardDecode(m, next, cache)
+      next = argmaxLast(logits, nVocab)
+    let elapsedNs = (getMonoTime().ticks - startNs).float64
+    result[i] = 1e9 * decodeSteps.float64 / elapsedNs
 
-proc printDecodeSummary(samples: seq[float64], decodeSteps: int) =
-  ## Print compact decode throughput metrics from collected timing samples.
+proc printDecodeSummary(tsSamples: seq[float64], decodeSteps: int) =
+  ## Print decode throughput: avg ± stdev tok/s (matching llama-bench style).
   let
-    minMs = minValue(samples)
-    avgMs = meanValue(samples)
-    minMsPerToken = minMs / decodeSteps.float64
-    avgMsPerToken = avgMs / decodeSteps.float64
-    minTokPerSec = 1000.0 / minMsPerToken
-    avgTokPerSec = 1000.0 / avgMsPerToken
+    avgTs = meanValue(tsSamples)
+    stdTs = stdevValue(tsSamples)
   echo "decode summary:"
-  echo fmt"  best total: {minMs:.3f} ms"
-  echo fmt"  mean total: {avgMs:.3f} ms"
-  echo fmt"  best ms/token: {minMsPerToken:.3f}"
-  echo fmt"  mean ms/token: {avgMsPerToken:.3f}"
-  echo fmt"  best tok/s: {minTokPerSec:.3f}"
-  echo fmt"  mean tok/s: {avgTokPerSec:.3f}"
+  echo fmt"  samples:   {tsSamples.len}"
+  echo fmt"  n_tokens:  {decodeSteps}"
+  echo fmt"  avg tok/s: {avgTs:.2f} ± {stdTs:.2f}"
 
 proc main() =
   ## Run benchmark cases with steady-state decode throughput reporting.
