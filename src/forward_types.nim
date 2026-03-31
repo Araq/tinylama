@@ -3,7 +3,8 @@
 import ./[model, tensor]
 
 when defined(useHippo):
-  import ./forward_hippo
+  import ./forward_hippo_types
+  export forward_hippo_types
 
 type
   KvCache* = object
@@ -15,19 +16,3 @@ type
     headDim*: int
     when defined(useHippo):
       gpuCache*: GpuKvCache
-
-proc initKvCache*(hp: HParams, maxLen: int): KvCache =
-  if hp.nHead <= 0:
-    raise newException(ValueError, "KV cache requires llama-style head_count")
-  result.maxLen = maxLen
-  result.curLen = 0
-  result.nHeadKv = hp.nHeadKv
-  result.headDim = hp.nEmb div hp.nHead
-  let kvDim = hp.nHeadKv * result.headDim
-  result.k = newSeq[Tensor](hp.nLayer)
-  result.v = newSeq[Tensor](hp.nLayer)
-  for i in 0 ..< hp.nLayer:
-    result.k[i] = newTensor(@[kvDim, maxLen])
-    result.v[i] = newTensor(@[kvDim, maxLen])
-  when defined(useHippo):
-    result.gpuCache = initGpuKvCache(hp.nLayer, hp.nHeadKv, result.headDim, maxLen)

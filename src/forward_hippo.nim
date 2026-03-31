@@ -1,11 +1,13 @@
-## Hippo GPU backend: kernels and GPU-resident forward pass.
+## Hippo GPU backend: kernels, orchestrators, and GPU-resident forward pass.
 ##
 ## All model weights, activations, and KV caches live on GPU.
 ## Only the initial token IDs are uploaded and final logits downloaded.
 
 import
   std/tables,
-  ./[tensor, model, gguf_loader, quant]
+  ./[forward_hippo_types, tensor, model, gguf_loader, quant]
+
+export forward_hippo_types
 
 when not defined(cpp):
   {.error: "useHippo requires Nim's C++ backend. Build with `nim cpp`.".}
@@ -170,18 +172,9 @@ template reduceMax256(sdata: var array[HippoBlockSize, float32], tid: int) =
           sdata[tid] = sdata[tid + 1]
       hippoSyncthreads()
 
-type
-  HippoAllocRef* = type(hippoMalloc(1))
-
 # ---------------------------------------------------------------------------
-# GpuTensor – a device-resident tensor
+# GpuTensor utilities
 # ---------------------------------------------------------------------------
-type
-  GpuTensor* = object
-    devicePtr*: pointer       # raw device pointer
-    alloc: HippoAllocRef      # ref-counted allocation (prevents free)
-    shape*: seq[int]
-    sizeBytes*: int
 
 proc newGpuTensor*(shape: seq[int]): GpuTensor =
   ## Allocate a new GPU tensor with the given shape.
@@ -1266,15 +1259,6 @@ proc ensureModelGpuPtrs*(m: var Model, hp: HParams) =
 # ---------------------------------------------------------------------------
 # GPU KV Cache
 # ---------------------------------------------------------------------------
-type
-  GpuKvCache* = object
-    k*: seq[GpuTensor]       # [kvDim, maxLen] per layer
-    v*: seq[GpuTensor]       # [kvDim, maxLen] per layer
-    curLen*: int
-    maxLen*: int
-    nHeadKv*: int
-    headDim*: int
-
 proc initGpuKvCache*(nLayer, nHeadKv, headDim, maxLen: int): GpuKvCache =
   ensureGpuContext()
   let kvDim = nHeadKv * headDim
