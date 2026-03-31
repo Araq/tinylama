@@ -443,15 +443,21 @@ when defined(useHippo):
     when defined(profileHippo):
       var kernelLaunchMs = 0.0
 
+    # First layer's attn rmsnorm (not fused with a residual)
+    when defined(profileHippo):
+      var kernelLaunchMs0 = 0.0
+      let klStart0 = epochTime()
+      recordStart(eventPairs, KcRmsNormAttn, stream)
+    gpuRmsnormCols(xNormPtr, xPtr, modelPtrs.layers[0].attnNorm, hp.nEmb, 1, hp.rmsEps, stream)
+    when defined(profileHippo):
+      recordStop(eventPairs, stream)
+      kernelLaunchMs0 += (epochTime() - klStart0) * 1000
+
     for layer in 0 ..< hp.nLayer:
       let lw = modelPtrs.layers[layer]
 
       when defined(profileHippo):
         let klStart = epochTime()
-        recordStart(eventPairs, KcRmsNormAttn, stream)
-      gpuRmsnormCols(xNormPtr, xPtr, lw.attnNorm, hp.nEmb, 1, hp.rmsEps, stream)
-      when defined(profileHippo):
-        recordStop(eventPairs, stream)
         recordStart(eventPairs, KcLinearQkv, stream)
       # Q/K/V projections — dispatch quantized or float32
       if lw.wqQ != nil:
@@ -493,11 +499,8 @@ when defined(useHippo):
       when defined(profileHippo):
         recordStop(eventPairs, stream)
         recordStart(eventPairs, KcResidualAttn, stream)
-      gpuAdd(xPtr, xPtr, tmp0, hp.nEmb, stream)
-      when defined(profileHippo):
-        recordStop(eventPairs, stream)
-        recordStart(eventPairs, KcRmsNormFfn, stream)
-      gpuRmsnormCols(xNormPtr, xPtr, lw.ffnNorm, hp.nEmb, 1, hp.rmsEps, stream)
+      # Fused: x += tmp0; xNorm = rmsnorm(x, ffnNorm)
+      gpuResidualRmsnorm(xNormPtr, xPtr, tmp0, lw.ffnNorm, hp.nEmb, hp.rmsEps, stream)
       when defined(profileHippo):
         recordStop(eventPairs, stream)
         recordStart(eventPairs, KcLinearGateUp, stream)
@@ -542,7 +545,14 @@ when defined(useHippo):
       when defined(profileHippo):
         recordStop(eventPairs, stream)
         recordStart(eventPairs, KcResidualFfn, stream)
-      gpuAdd(xPtr, xPtr, tmp0, hp.nEmb, stream)
+      if layer < hp.nLayer - 1:
+        # Fused: x += tmp0; xNorm = rmsnorm(x, nextLayer.attnNorm)
+        gpuResidualRmsnorm(xNormPtr, xPtr, tmp0,
+                            modelPtrs.layers[layer + 1].attnNorm,
+                            hp.nEmb, hp.rmsEps, stream)
+      else:
+        # Last layer: plain residual, rmsnorm happens below with final norm weight
+        gpuAdd(xPtr, xPtr, tmp0, hp.nEmb, stream)
       when defined(profileHippo):
         recordStop(eventPairs, stream)
         kernelLaunchMs += (epochTime() - klStart) * 1000

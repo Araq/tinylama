@@ -1158,6 +1158,53 @@ proc gpuRmsnormCols*(dst: pointer, x, weight: pointer, dim, seqLen: int,
                     args = hippoArgs(xPtr, wPtr, dPtr, dimArg, seqLenArg, epsArg))
 
 # ---------------------------------------------------------------------------
+# Kernel: Fused residual add + RMSNorm (decode only, seqLen=1)
+# Combines x += residual; out = rmsnorm(x, weight) into one launch.
+# ---------------------------------------------------------------------------
+proc residualRmsnormKernel(
+  xData, residualData, weightData, outData: ptr float32,
+  dim: cint, eps: float32
+) {.hippoGlobal.} =
+  var sdata {.hippoShared.}: array[HippoBlockSize, float32]
+  let tid = int(threadIdx.x)
+  let x = cast[ptr UncheckedArray[float32]](xData)
+  let res = cast[ptr UncheckedArray[float32]](residualData)
+  let w = cast[ptr UncheckedArray[float32]](weightData)
+  let o = cast[ptr UncheckedArray[float32]](outData)
+  # Pass 1: add residual in-place and accumulate sum-of-squares
+  var ss = 0.0'f32
+  var r = tid
+  while r < int(dim):
+    let v = x[r] + res[r]
+    x[r] = v
+    ss = ss + v * v
+    r = r + int(blockDim.x)
+  sdata[tid] = ss
+  hippoSyncthreads()
+  reduceSum256(sdata, tid)
+  # Broadcast inverse RMS
+  var inv {.hippoShared.}: array[1, float32]
+  if tid == 0:
+    inv[0] = 1.0'f32 / sqrtf(sdata[0] / cfloat(dim) + cfloat(eps))
+  hippoSyncthreads()
+  # Pass 2: normalize
+  let invVal = inv[0]
+  r = tid
+  while r < int(dim):
+    o[r] = x[r] * invVal * w[r]
+    r = r + int(blockDim.x)
+
+proc gpuResidualRmsnorm*(normOut, x, residual, weight: pointer, dim: int,
+                          eps: float32, stream: HippoStream) =
+  let grid = newDim3(1'u32)
+  let blk = newDim3(HippoBlockSize.uint32)
+  var xPtr = x; var resPtr = residual; var wPtr = weight; var dPtr = normOut
+  var dimArg = dim.cint; var epsArg = eps
+  hippoLaunchKernel(residualRmsnormKernel, gridDim = grid, blockDim = blk,
+                    stream = stream,
+                    args = hippoArgs(xPtr, resPtr, wPtr, dPtr, dimArg, epsArg))
+
+# ---------------------------------------------------------------------------
 # Kernel: Embedding lookup
 # ---------------------------------------------------------------------------
 proc embeddingKernel(
