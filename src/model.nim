@@ -8,11 +8,11 @@ when cpuEndian != littleEndian:
   import std/endians
 
 const
-  GGML_TYPE_F32* = 0
-  GGML_TYPE_F16* = 1
-  GGML_TYPE_Q2_K* = 10
-  GGML_TYPE_Q3_K* = 11
-  GGML_TYPE_Q6_K* = 14
+  GgmlTypeF32* = 0
+  GgmlTypeF16* = 1
+  GgmlTypeQ2K* = 10
+  GgmlTypeQ3K* = 11
+  GgmlTypeQ6K* = 14
 
 type
   HParams* = object
@@ -54,27 +54,27 @@ proc loadTensorF32(g: GgufFile, info: GgufTensorInfo): Tensor =
   let rowLen = int(info.ne[0])
   let rows = if rowLen > 0: count div rowLen else: 0
   case info.elemType
-  of GGML_TYPE_F32:
+  of GgmlTypeF32:
     copyMem(addr result.data[0], addr dataPtr[0], count * 4)
-  of GGML_TYPE_F16:
+  of GgmlTypeF16:
     for i in 0 ..< count:
       var u = cast[ptr UncheckedArray[uint16]](addr dataPtr[i * 2])[0]
       when cpuEndian != littleEndian:
         u = swapEndian(u)
       result.data[i] = halfToFloat(u)
-  of GGML_TYPE_Q2_K:
+  of GgmlTypeQ2K:
     let rowSize = rowSizeQ2K(rowLen)
     for r in 0 ..< rows:
       let src = cast[ptr UncheckedArray[byte]](addr dataPtr[r * rowSize])
       let dst = cast[ptr UncheckedArray[float32]](addr result.data[r * rowLen])
       dequantRowQ2K(src, dst, rowLen)
-  of GGML_TYPE_Q3_K:
+  of GgmlTypeQ3K:
     let rowSize = rowSizeQ3K(rowLen)
     for r in 0 ..< rows:
       let src = cast[ptr UncheckedArray[byte]](addr dataPtr[r * rowSize])
       let dst = cast[ptr UncheckedArray[float32]](addr result.data[r * rowLen])
       dequantRowQ3K(src, dst, rowLen)
-  of GGML_TYPE_Q6_K:
+  of GgmlTypeQ6K:
     let rowSize = rowSizeQ6K(rowLen)
     for r in 0 ..< rows:
       let src = cast[ptr UncheckedArray[byte]](addr dataPtr[r * rowSize])

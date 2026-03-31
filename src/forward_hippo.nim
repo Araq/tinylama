@@ -222,9 +222,9 @@ proc cachedQuantWeight*(name: string, m: var Model, tensorName: string): GpuQuan
   let nCols = int(info.ne[0])
   let nRows = tensorElemCount(info) div nCols
   let rowSize = case info.elemType
-    of GGML_TYPE_Q2_K: rowSizeQ2K(nCols)
-    of GGML_TYPE_Q3_K: rowSizeQ3K(nCols)
-    of GGML_TYPE_Q6_K: rowSizeQ6K(nCols)
+    of GgmlTypeQ2K: rowSizeQ2K(nCols)
+    of GgmlTypeQ3K: rowSizeQ3K(nCols)
+    of GgmlTypeQ6K: rowSizeQ6K(nCols)
     else: raise newException(ValueError, "unsupported quant type for GPU upload: " & $info.elemType)
   let totalBytes = rowSize * nRows
   let alloc = hippoMalloc(totalBytes)
@@ -612,8 +612,8 @@ proc gpuLinearColQuant*(dst, x, wQuant: pointer, wCols, wRows: int,
                          quantType: int32, stream: HippoStream) =
   ## Dispatch to the appropriate quantized GEMV kernel based on quant type.
   case quantType
-  of GGML_TYPE_Q2_K: gpuLinearColQ2K(dst, x, wQuant, wCols, wRows, stream)
-  of GGML_TYPE_Q3_K: gpuLinearColQ3K(dst, x, wQuant, wCols, wRows, stream)
+  of GgmlTypeQ2K: gpuLinearColQ2K(dst, x, wQuant, wCols, wRows, stream)
+  of GgmlTypeQ3K: gpuLinearColQ3K(dst, x, wQuant, wCols, wRows, stream)
   else: raise newException(ValueError, "unsupported quant type for GPU GEMV: " & $quantType)
 
 proc ensureModelGpuPtrs*(m: var Model, hp: HParams) =
@@ -644,7 +644,7 @@ proc ensureModelGpuPtrs*(m: var Model, hp: HParams) =
     template uploadWeight(fp32Field, quantField, qtypeField: untyped, tensorSuffix: string) =
       let tn = lp & tensorSuffix
       let et = m.infos[tn].elemType.int32
-      if et in {GGML_TYPE_Q2_K.int32, GGML_TYPE_Q3_K.int32}:
+      if et in {GgmlTypeQ2K.int32, GgmlTypeQ3K.int32}:
         let qw = cachedQuantWeight(tn, m, tn)
         quantField = qw.devicePtr
         fp32Field = nil

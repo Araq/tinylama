@@ -7,10 +7,10 @@ when cpuEndian != littleEndian:
   import std/endians
 
 const
-  ggufMagic* = "GGUF"
-  ggufVersion* = 3'u32
-  ggufDefaultAlignment* = 32'u32
-  ggufMaxDims* = 4
+  GgufMagic* = "GGUF"
+  GgufVersion* = 3'u32
+  GgufDefaultAlignment* = 32'u32
+  GgufMaxDims* = 4
 
 type
   GgufType* = enum
@@ -61,7 +61,7 @@ type
   GgufTensorInfo* = object
     name*: string
     nDims*: uint32
-    ne*: array[ggufMaxDims, uint64]
+    ne*: array[GgufMaxDims, uint64]
     elemType*: int32  ## raw ggml_type id
     offset*: uint64   ## relative to start of data section
 
@@ -195,7 +195,7 @@ proc openGguf*(path: string; debug = false): GgufFile =
   result.mem = memfiles.open(path, fmRead)
   result.data = cast[ptr UncheckedArray[byte]](result.mem.mem)
   result.size = result.mem.size
-  result.alignment = ggufDefaultAlignment
+  result.alignment = GgufDefaultAlignment
   var pos = 0
 
   ensure(result.size >= 4, "GGUF: file too small")
@@ -225,8 +225,8 @@ proc openGguf*(path: string; debug = false): GgufFile =
     var info: GgufTensorInfo
     info.name = readString(result.data, result.size, pos)
     info.nDims = readU32(result.data, result.size, pos)
-    ensure(info.nDims <= ggufMaxDims.uint32, "GGUF: invalid tensor dims")
-    for d in 0 ..< ggufMaxDims:
+    ensure(info.nDims <= GgufMaxDims.uint32, "GGUF: invalid tensor dims")
+    for d in 0 ..< GgufMaxDims:
       info.ne[d] = 1'u64
     for d in 0 ..< int(info.nDims):
       info.ne[d] = readU64(result.data, result.size, pos)

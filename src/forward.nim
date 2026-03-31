@@ -10,10 +10,10 @@ when defined(profileHippo):
 
   type
     KernelCategory* = enum
-      kcEmbedding, kcRmsNormAttn, kcLinearQKV, kcRope, kcKvStore,
-      kcAttention, kcLinearO, kcResidualAttn, kcRmsNormFfn,
-      kcLinearGateUp, kcSiluMul, kcLinearDown, kcResidualFfn,
-      kcFinalNormOutput
+      KcEmbedding, KcRmsNormAttn, KcLinearQkv, KcRope, KcKvStore,
+      KcAttention, KcLinearO, KcResidualAttn, KcRmsNormFfn,
+      KcLinearGateUp, KcSiluMul, KcLinearDown, KcResidualFfn,
+      KcFinalNormOutput
 
     EventPair* = object
       start*: HippoEvent
@@ -433,7 +433,7 @@ when defined(useHippo):
     let tmp2 = gpuCtx.scratch2.devicePtr
 
     when defined(profileHippo):
-      recordStart(eventPairs, kcEmbedding, stream)
+      recordStart(eventPairs, KcEmbedding, stream)
     gpuEmbedding(xPtr, modelPtrs.tokEmb, cast[ptr int32](tokenPtr),
                  hp.nEmb, 1, hp.nVocab, stream)
     when defined(profileHippo):
@@ -447,11 +447,11 @@ when defined(useHippo):
 
       when defined(profileHippo):
         let klStart = epochTime()
-        recordStart(eventPairs, kcRmsNormAttn, stream)
+        recordStart(eventPairs, KcRmsNormAttn, stream)
       gpuRmsnormCols(xNormPtr, xPtr, lw.attnNorm, hp.nEmb, 1, hp.rmsEps, stream)
       when defined(profileHippo):
         recordStop(eventPairs, stream)
-        recordStart(eventPairs, kcLinearQKV, stream)
+        recordStart(eventPairs, KcLinearQkv, stream)
       # Q/K/V projections — dispatch quantized or float32
       if lw.wqQ != nil:
         gpuLinearColQuant(tmp0, xNormPtr, lw.wqQ, hp.nEmb, hp.nEmb, lw.wqQType, stream)
@@ -467,39 +467,39 @@ when defined(useHippo):
         gpuLinearCol(tmp2, xNormPtr, lw.wv, hp.nEmb, kvDim, 1, stream)
       when defined(profileHippo):
         recordStop(eventPairs, stream)
-        recordStart(eventPairs, kcRope, stream)
+        recordStart(eventPairs, KcRope, stream)
       gpuRopeAtPos(tmp0, hp.nHead, headDim, ropeDim, hp.ropeFreqBase, pos, 1, stream)
       gpuRopeAtPos(tmp1, hp.nHeadKv, headDim, ropeDim, hp.ropeFreqBase, pos, 1, stream)
       when defined(profileHippo):
         recordStop(eventPairs, stream)
-        recordStart(eventPairs, kcKvStore, stream)
+        recordStart(eventPairs, KcKvStore, stream)
       gpuStoreKV(cache.gpuCache.k[layer].devicePtr, tmp1, kvDim, 1, cache.gpuCache.maxLen, pos, stream)
       gpuStoreKV(cache.gpuCache.v[layer].devicePtr, tmp2, kvDim, 1, cache.gpuCache.maxLen, pos, stream)
       when defined(profileHippo):
         recordStop(eventPairs, stream)
-        recordStart(eventPairs, kcAttention, stream)
+        recordStart(eventPairs, KcAttention, stream)
       gpuAttentionDecode(xNormPtr, tmp0, cache.gpuCache.k[layer].devicePtr,
                          cache.gpuCache.v[layer].devicePtr,
                          hp.nHead, hp.nHeadKv, headDim, pos + 1,
                          cache.gpuCache.maxLen, stream)
       when defined(profileHippo):
         recordStop(eventPairs, stream)
-        recordStart(eventPairs, kcLinearO, stream)
+        recordStart(eventPairs, KcLinearO, stream)
       if lw.woQ != nil:
         gpuLinearColQuant(tmp0, xNormPtr, lw.woQ, hp.nEmb, hp.nEmb, lw.woQType, stream)
       else:
         gpuLinearCol(tmp0, xNormPtr, lw.wo, hp.nEmb, hp.nEmb, 1, stream)
       when defined(profileHippo):
         recordStop(eventPairs, stream)
-        recordStart(eventPairs, kcResidualAttn, stream)
+        recordStart(eventPairs, KcResidualAttn, stream)
       gpuAdd(xPtr, xPtr, tmp0, hp.nEmb, stream)
       when defined(profileHippo):
         recordStop(eventPairs, stream)
-        recordStart(eventPairs, kcRmsNormFfn, stream)
+        recordStart(eventPairs, KcRmsNormFfn, stream)
       gpuRmsnormCols(xNormPtr, xPtr, lw.ffnNorm, hp.nEmb, 1, hp.rmsEps, stream)
       when defined(profileHippo):
         recordStop(eventPairs, stream)
-        recordStart(eventPairs, kcLinearGateUp, stream)
+        recordStart(eventPairs, KcLinearGateUp, stream)
       if lw.wGateQ != nil:
         gpuLinearColQuant(tmp0, xNormPtr, lw.wGateQ, hp.nEmb, hp.nFfn, lw.wGateQType, stream)
       else:
@@ -510,25 +510,25 @@ when defined(useHippo):
         gpuLinearCol(tmp1, xNormPtr, lw.wUp, hp.nEmb, hp.nFfn, 1, stream)
       when defined(profileHippo):
         recordStop(eventPairs, stream)
-        recordStart(eventPairs, kcSiluMul, stream)
+        recordStart(eventPairs, KcSiluMul, stream)
       gpuSiluMul(tmp2, tmp0, tmp1, hp.nFfn, stream)
       when defined(profileHippo):
         recordStop(eventPairs, stream)
-        recordStart(eventPairs, kcLinearDown, stream)
+        recordStart(eventPairs, KcLinearDown, stream)
       if lw.wDownQ != nil:
         gpuLinearColQuant(tmp0, tmp2, lw.wDownQ, hp.nFfn, hp.nEmb, lw.wDownQType, stream)
       else:
         gpuLinearCol(tmp0, tmp2, lw.wDown, hp.nFfn, hp.nEmb, 1, stream)
       when defined(profileHippo):
         recordStop(eventPairs, stream)
-        recordStart(eventPairs, kcResidualFfn, stream)
+        recordStart(eventPairs, KcResidualFfn, stream)
       gpuAdd(xPtr, xPtr, tmp0, hp.nEmb, stream)
       when defined(profileHippo):
         recordStop(eventPairs, stream)
         kernelLaunchMs += (epochTime() - klStart) * 1000
 
     when defined(profileHippo):
-      recordStart(eventPairs, kcFinalNormOutput, stream)
+      recordStart(eventPairs, KcFinalNormOutput, stream)
     gpuRmsnormCols(xNormPtr, xPtr, modelPtrs.normWeight, hp.nEmb, 1, hp.rmsEps, stream)
     gpuLinearCol(xPtr, xNormPtr, modelPtrs.outputWeight, modelPtrs.outputShape0, modelPtrs.outputShape1, 1, stream)
     when defined(profileHippo):
