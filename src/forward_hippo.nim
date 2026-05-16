@@ -2036,7 +2036,7 @@ proc outputWeightForLinear(w: Tensor, nEmb, nVocab: int): Tensor =
 
 proc forwardPrefillHippo*(m: var Model, tokens: seq[int32], cache: var KvCache): Tensor =
   let hp = m.hparams
-  if hp.arch != "" and hp.arch != "llama":
+  if hp.arch != "" and hp.arch != "llama" and hp.arch != "qwen2":
     raise newException(ValueError, "unsupported architecture: " & hp.arch)
   if hp.nHeadKv != 0 and (hp.nHead mod hp.nHeadKv) != 0:
     raise newException(ValueError, "GQA requires head_count divisible by head_count_kv")
@@ -2121,7 +2121,7 @@ proc forwardPrefillHippo*(m: var Model, tokens: seq[int32], cache: var KvCache):
 
 proc forwardDecodeHippo*(m: var Model, token: int32, cache: var KvCache): Tensor =
   let hp = m.hparams
-  if hp.arch != "" and hp.arch != "llama":
+  if hp.arch != "" and hp.arch != "llama" and hp.arch != "qwen2":
     raise newException(ValueError, "unsupported architecture: " & hp.arch)
   if hp.nHeadKv != 0 and (hp.nHead mod hp.nHeadKv) != 0:
     raise newException(ValueError, "GQA requires head_count divisible by head_count_kv")

@@ -10,8 +10,11 @@ import ./quant
 const
   GgmlTypeF32* = 0
   GgmlTypeF16* = 1
+  GgmlTypeQ5_0* = 6
+  GgmlTypeQ8_0* = 8
   GgmlTypeQ2K* = 10
   GgmlTypeQ3K* = 11
+  GgmlTypeQ4K* = 12
   GgmlTypeQ6K* = 14
 
 type
@@ -74,6 +77,24 @@ proc loadTensorF32(g: GgufFile, info: GgufTensorInfo): Tensor =
       let src = cast[ptr UncheckedArray[byte]](addr dataPtr[r * rowSize])
       let dst = cast[ptr UncheckedArray[float32]](addr result.data[r * rowLen])
       dequantRowQ3K(src, dst, rowLen)
+  of GgmlTypeQ5_0:
+    let rowSize = rowSizeQ5_0(rowLen)
+    for r in 0 ..< rows:
+      let src = cast[ptr UncheckedArray[byte]](addr dataPtr[r * rowSize])
+      let dst = cast[ptr UncheckedArray[float32]](addr result.data[r * rowLen])
+      dequantRowQ5_0(src, dst, rowLen)
+  of GgmlTypeQ8_0:
+    let rowSize = rowSizeQ8_0(rowLen)
+    for r in 0 ..< rows:
+      let src = cast[ptr UncheckedArray[byte]](addr dataPtr[r * rowSize])
+      let dst = cast[ptr UncheckedArray[float32]](addr result.data[r * rowLen])
+      dequantRowQ8_0(src, dst, rowLen)
+  of GgmlTypeQ4K:
+    let rowSize = rowSizeQ4K(rowLen)
+    for r in 0 ..< rows:
+      let src = cast[ptr UncheckedArray[byte]](addr dataPtr[r * rowSize])
+      let dst = cast[ptr UncheckedArray[float32]](addr result.data[r * rowLen])
+      dequantRowQ4K(src, dst, rowLen)
   of GgmlTypeQ6K:
     let rowSize = rowSizeQ6K(rowLen)
     for r in 0 ..< rows:
@@ -83,20 +104,38 @@ proc loadTensorF32(g: GgufFile, info: GgufTensorInfo): Tensor =
   else:
     raise newException(ValueError, "unsupported ggml type: " & $info.elemType)
 
+proc getKvU32Arch(g: GgufFile, arch, suffix: string, outv: var int): bool =
+  var v: uint32
+  if arch.len > 0 and g.getKvU32(arch & "." & suffix, v):
+    outv = int(v)
+    return true
+  if arch != "llama" and g.getKvU32("llama." & suffix, v):
+    outv = int(v)
+    return true
+  false
+
+proc getKvF32Arch(g: GgufFile, arch, suffix: string, outv: var float32): bool =
+  if arch.len > 0 and g.getKvF32(arch & "." & suffix, outv):
+    return true
+  if arch != "llama" and g.getKvF32("llama." & suffix, outv):
+    return true
+  false
+
 proc loadHParams(g: GgufFile): HParams =
   discard g.getKvStr("general.architecture", result.arch)
-  var v: uint32
-  if g.getKvU32("llama.vocab_size", v): result.nVocab = int(v)
-  if g.getKvU32("llama.context_length", v): result.nCtx = int(v)
-  if g.getKvU32("llama.embedding_length", v): result.nEmb = int(v)
-  if g.getKvU32("llama.block_count", v): result.nLayer = int(v)
-  if g.getKvU32("llama.feed_forward_length", v): result.nFfn = int(v)
-  if g.getKvU32("llama.attention.head_count", v): result.nHead = int(v)
-  if g.getKvU32("llama.attention.head_count_kv", v): result.nHeadKv = int(v)
-  if g.getKvU32("llama.rope.dimension_count", v): result.ropeDim = int(v)
-  var f: float32
-  if g.getKvF32("llama.rope.freq_base", f): result.ropeFreqBase = f
-  if g.getKvF32("llama.attention.layer_norm_rms_epsilon", f): result.rmsEps = f
+  let archPrefix = if result.arch.len > 0: result.arch else: "llama"
+  discard getKvU32Arch(g, archPrefix, "vocab_size", result.nVocab)
+  discard getKvU32Arch(g, archPrefix, "context_length", result.nCtx)
+  discard getKvU32Arch(g, archPrefix, "embedding_length", result.nEmb)
+  discard getKvU32Arch(g, archPrefix, "block_count", result.nLayer)
+  discard getKvU32Arch(g, archPrefix, "feed_forward_length", result.nFfn)
+  discard getKvU32Arch(g, archPrefix, "attention.head_count", result.nHead)
+  discard getKvU32Arch(g, archPrefix, "attention.head_count_kv", result.nHeadKv)
+  discard getKvU32Arch(g, archPrefix, "rope.dimension_count", result.ropeDim)
+  discard getKvF32Arch(g, archPrefix, "rope.freq_base", result.ropeFreqBase)
+  discard getKvF32Arch(g, archPrefix, "attention.layer_norm_rms_epsilon", result.rmsEps)
+  if result.nHeadKv == 0:
+    result.nHeadKv = result.nHead
   if result.nVocab == 0:
     var tokens: seq[string]
     if g.getKvArrStr("tokenizer.ggml.tokens", tokens):

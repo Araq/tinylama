@@ -1,6 +1,6 @@
-## Minimal tokenizer for GGUF models (SPM/LLaMA style).
+## Minimal tokenizer for GGUF models (SPM/LLaMA + basic GPT2 byte-BPE IO).
 
-import std/[tables, heapqueue, strutils, sequtils]
+import std/[tables, heapqueue, strutils, sequtils, unicode]
 import ./gguf_loader
 
 const
@@ -36,6 +36,7 @@ type
     unkId*: int32
     modelType*: string
     chatTemplate*: string
+    bpeRanks*: Table[string, int]
 
   Symbol = object
     prev, next: int
@@ -51,6 +52,37 @@ proc `<`(a, b: Bigram): bool =
   if a.keyScore == b.keyScore:
     return a.keyLeft < b.keyLeft
   a.keyScore < b.keyScore
+
+var
+  gpt2MapsInited = false
+  gpt2ByteEncode: array[256, string]
+  gpt2ByteDecode: Table[int32, uint8]
+
+proc initGpt2ByteMaps() =
+  if gpt2MapsInited:
+    return
+  var bs: seq[int] = @[]
+  for i in 33 .. 126: bs.add(i)
+  for i in 161 .. 172: bs.add(i)
+  for i in 174 .. 255: bs.add(i)
+  var present = newSeq[bool](256)
+  for b in bs:
+    present[b] = true
+  var cs = bs
+  var n = 0
+  for b in 0 .. 255:
+    if not present[b]:
+      bs.add(b)
+      cs.add(256 + n)
+      inc n
+  gpt2ByteDecode = initTable[int32, uint8](256)
+  for i in 0 ..< bs.len:
+    let b = bs[i]
+    let cp = cs[i]
+    let piece = $Rune(cp)
+    gpt2ByteEncode[b] = piece
+    gpt2ByteDecode[int32(cp)] = uint8(b)
+  gpt2MapsInited = true
 
 proc utf8Len(b: byte): int =
   if b < 0x80: return 1
@@ -92,6 +124,8 @@ proc loadVocab*(g: GgufFile): Vocab =
   discard g.getKvArrI32(tokenTypesKey, tokenTypes)
   if tokenTypes.len != tokenList.len:
     tokenTypes.setLen(tokenList.len)
+  var merges: seq[string]
+  discard g.getKvArrStr("tokenizer.ggml.merges", merges)
 
   var addBos = false
   var addEos = false
@@ -127,6 +161,13 @@ proc loadVocab*(g: GgufFile): Vocab =
   result.tokenToId = initTable[string, int](tokenList.len * 2)
   for i, tok in tokenList:
     result.tokenToId[tok] = i
+  result.bpeRanks = initTable[string, int](max(merges.len * 2, 16))
+  for i, m in merges:
+    let sp = m.find(' ')
+    if sp > 0 and sp + 1 < m.len:
+      let a = m[0 ..< sp]
+      let b = m[sp + 1 .. ^1]
+      result.bpeRanks[a & "\t" & b] = i
 
 proc tokenizeSpm(v: Vocab, text: string): seq[int32] =
   var raw = text
@@ -224,15 +265,71 @@ proc tokenizeSpm(v: Vocab, text: string): seq[int32] =
 
   outp
 
+proc tokenizeGpt2Bytes(v: Vocab, text: string): seq[int32] =
+  ## GPT2/Qwen2 byte-level encode with merge-rank BPE.
+  initGpt2ByteMaps()
+  var raw = text
+  if v.addSpacePrefix and raw.len > 0:
+    raw = " " & raw
+  var symbols: seq[string] = @[]
+  symbols.setLen(raw.len)
+  for i, ch in raw:
+    let b = ord(ch)
+    if b < 0 or b > 255:
+      symbols[i] = ""
+    else:
+      symbols[i] = gpt2ByteEncode[b]
+
+  if v.bpeRanks.len > 0 and symbols.len >= 2:
+    while true:
+      var bestRank = high(int)
+      var bestPos = -1
+      for i in 0 ..< symbols.len - 1:
+        let key = symbols[i] & "\t" & symbols[i + 1]
+        if v.bpeRanks.hasKey(key):
+          let r = v.bpeRanks[key]
+          if r < bestRank:
+            bestRank = r
+            bestPos = i
+      if bestPos < 0:
+        break
+      symbols[bestPos] = symbols[bestPos] & symbols[bestPos + 1]
+      symbols.delete(bestPos + 1)
+
+  result = @[]
+  for piece in symbols:
+    if piece.len == 0:
+      result.add(v.unkId)
+    elif v.tokenToId.hasKey(piece):
+      result.add(int32(v.tokenToId[piece]))
+    else:
+      var matched = false
+      for r in piece.runes:
+        let rs = $r
+        if v.tokenToId.hasKey(rs):
+          result.add(int32(v.tokenToId[rs]))
+          matched = true
+        else:
+          result.add(v.unkId)
+      if not matched:
+        result.add(v.unkId)
+
 proc tokenize*(v: Vocab, text: string, addSpecial = true): seq[int32] =
-  result = tokenizeSpm(v, text)
+  if v.modelType == "gpt2":
+    result = tokenizeGpt2Bytes(v, text)
+  else:
+    result = tokenizeSpm(v, text)
   if addSpecial and v.addBos:
     result.insert(v.bosId, 0)
   if addSpecial and v.addEos:
     result.add(v.eosId)
 
 proc tokenizeWithSpecial*(v: Vocab, text: string, addSpecial = true): seq[int32] =
-  var specials = @["<|user|>", "<|assistant|>", "<|system|>", "</s>", "<s>"]
+  var specials = @[
+    "<|user|>", "<|assistant|>", "<|system|>",
+    "<|im_start|>", "<|im_end|>", "<|endoftext|>",
+    "</s>", "<s>"
+  ]
   specials = specials.filterIt(v.tokenToId.hasKey(it))
   if specials.len == 0:
     return tokenize(v, text, addSpecial)
@@ -268,6 +365,31 @@ proc tokenToPiece*(v: Vocab, id: int32): string =
   result = v.tokens[idx].text
 
 proc detokenize*(v: Vocab, tokens: seq[int32]): string =
+  if v.modelType == "gpt2":
+    initGpt2ByteMaps()
+    var outBytes: seq[byte] = @[]
+    for t in tokens:
+      let piece = tokenToPiece(v, t)
+      if t == v.bosId or t == v.eosId:
+        continue
+      if piece == "<s>" or piece == "</s>" or piece == "<|user|>" or
+         piece == "<|assistant|>" or piece == "<|system|>" or
+         piece == "<|im_start|>" or piece == "<|im_end|>" or
+         piece == "<|endoftext|>":
+        continue
+      for r in piece.runes:
+        let ri = int32(r)
+        if gpt2ByteDecode.hasKey(ri):
+          outBytes.add(gpt2ByteDecode[ri])
+        else:
+          let utf = $r
+          for c in utf:
+            outBytes.add(byte(ord(c)))
+    result = newString(outBytes.len)
+    for i, b in outBytes:
+      result[i] = char(b)
+    return
+
   result = ""
   for t in tokens:
     let piece = tokenToPiece(v, t)
@@ -288,9 +410,11 @@ proc detokenize*(v: Vocab, tokens: seq[int32]): string =
   result = result.replace("\xE2\x96\x81", " ")
 
 proc formatChatPrompt*(v: Vocab, userText: string): string =
-  ## Minimal support for the TinyLlama chat template pattern.
+  ## Minimal support for TinyLlama and Qwen-style chat templates.
   if v.chatTemplate.len == 0:
     return userText
+  if v.chatTemplate.contains("<|im_start|>") and v.chatTemplate.contains("<|im_end|>"):
+    return "<|im_start|>user\n" & userText & "<|im_end|>\n<|im_start|>assistant\n"
   if v.chatTemplate.contains("<|user|>") and v.chatTemplate.contains("<|assistant|>"):
     let eosPiece = tokenToPiece(v, v.eosId)
     return "<|user|>\n" & userText & eosPiece & "<|assistant|>"
