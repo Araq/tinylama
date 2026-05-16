@@ -8,17 +8,23 @@ export forward_types
 
 when defined(useHippo) and defined(useMalebolgia):
   {.error: "useHippo and useMalebolgia are mutually exclusive. Choose one backend.".}
+when defined(useHippo) and defined(useSycl):
+  {.error: "useHippo and useSycl are mutually exclusive. Choose one backend.".}
+when defined(useSycl) and defined(useMalebolgia):
+  {.error: "useSycl and useMalebolgia are mutually exclusive. Choose one backend.".}
 
 when defined(useMalebolgia):
   import malebolgia
 
 when defined(useHippo):
   import ./forward_hippo
+when defined(useSycl):
+  import ./forward_sycl
 
 proc isSupportedArch(arch: string): bool =
   arch.len == 0 or arch == "llama" or arch == "qwen2"
 
-proc initKvCache*(hp: HParams, maxLen: int): KvCache =
+proc initKvCacheCpu(hp: HParams, maxLen: int): KvCache =
   if hp.nHead <= 0:
     raise newException(ValueError, "KV cache requires attention head_count")
   result.maxLen = maxLen
@@ -31,8 +37,28 @@ proc initKvCache*(hp: HParams, maxLen: int): KvCache =
   for i in 0 ..< hp.nLayer:
     result.k[i] = newTensor(@[kvDim, maxLen])
     result.v[i] = newTensor(@[kvDim, maxLen])
-  when defined(useHippo):
+
+when defined(useHippo):
+  proc initKvCacheHippo(hp: HParams, maxLen: int): KvCache =
+    result = initKvCacheCpu(hp, maxLen)
     result.gpuCache = initGpuKvCache(hp.nLayer, hp.nHeadKv, result.headDim, maxLen)
+
+when defined(useSycl):
+  proc initKvCacheSycl(hp: HParams, maxLen: int): KvCache =
+    ## Initial SYCL backend starts with CPU-compatible KV layout.
+    ## Device-resident KV storage can replace this in the next stage.
+    result = initKvCacheCpu(hp, maxLen)
+
+type
+  InitKvCacheRelay* = proc(hp: HParams, maxLen: int): KvCache {.nimcall.}
+  ForwardPrefillRelay* = proc(m: var Model, tokens: seq[int32], cache: var KvCache): Tensor {.nimcall.}
+  ForwardDecodeRelay* = proc(m: var Model, token: int32, cache: var KvCache): Tensor {.nimcall.}
+
+var
+  initKvCacheRelay*: InitKvCacheRelay
+  forwardPrefillRelay*: ForwardPrefillRelay
+  forwardDecodeRelay*: ForwardDecodeRelay
+  forwardRelaysInitialized = false
 
 proc getTensorOr(m: var Model, a, b: string): Tensor =
   try:
@@ -255,96 +281,131 @@ proc storeKVRange(cache: var KvCache, layer: int, startPos: int, k, v: Tensor) =
       cache.k[layer].data[dst + c] = k.data[src + c]
       cache.v[layer].data[dst + c] = v.data[src + c]
 
+proc forwardPrefillCpu(m: var Model, tokens: seq[int32], cache: var KvCache): Tensor =
+  let hp = m.hparams
+  if not isSupportedArch(hp.arch):
+    raise newException(ValueError, "unsupported architecture: " & hp.arch)
+  if hp.nHeadKv != 0 and (hp.nHead mod hp.nHeadKv) != 0:
+    raise newException(ValueError, "GQA requires head_count divisible by head_count_kv")
+  let headDim = hp.nEmb div hp.nHead
+  let ropeDim = if hp.ropeDim > 0: hp.ropeDim else: headDim
+
+  let tokEmb = getTensorOr(m, "tok_embeddings.weight", "token_embd.weight")
+  var x = embeddingLookup(tokEmb, tokens, hp.nVocab, hp.nEmb)
+  cache.curLen = tokens.len
+
+  for layer in 0 ..< hp.nLayer:
+    let attnNorm = m.getTensor("blk." & $layer & ".attn_norm.weight")
+    let ffnNorm = m.getTensor("blk." & $layer & ".ffn_norm.weight")
+    let wq = m.getTensor("blk." & $layer & ".attn_q.weight")
+    let wk = m.getTensor("blk." & $layer & ".attn_k.weight")
+    let wv = m.getTensor("blk." & $layer & ".attn_v.weight")
+    let wo = m.getTensor("blk." & $layer & ".attn_output.weight")
+    let wGate = m.getTensor("blk." & $layer & ".ffn_gate.weight")
+    let wUp = m.getTensor("blk." & $layer & ".ffn_up.weight")
+    let wDown = m.getTensor("blk." & $layer & ".ffn_down.weight")
+
+    let xNorm = rmsnormCols(x, attnNorm, hp.rmsEps)
+    var q = linearGGMLCol(xNorm, wq)
+    var k = linearGGMLCol(xNorm, wk)
+    let v = linearGGMLCol(xNorm, wv)
+    applyRopeSingle(q, hp.nHead, headDim, ropeDim, hp.ropeFreqBase)
+    applyRopeSingle(k, hp.nHeadKv, headDim, ropeDim, hp.ropeFreqBase)
+    storeKVRange(cache, layer, 0, k, v)
+    let attnOut = attentionFull(q, k, v, wo, hp.nHead, hp.nHeadKv, headDim)
+    x = add(x, attnOut)
+
+    let xNorm2 = rmsnormCols(x, ffnNorm, hp.rmsEps)
+    let ffnOut = ffn(xNorm2, wGate, wUp, wDown)
+    x = add(x, ffnOut)
+
+  let norm = getTensorOr(m, "norm.weight", "output_norm.weight")
+  let outW = getTensorAny(m, ["output.weight", "token_embd.weight", "tok_embeddings.weight"])
+  let xNormFinal = rmsnormCols(x, norm, hp.rmsEps)
+  result = linearOut(xNormFinal, outW, hp.nEmb, hp.nVocab)
+
+proc forwardDecodeCpu(m: var Model, token: int32, cache: var KvCache): Tensor =
+  let hp = m.hparams
+  if not isSupportedArch(hp.arch):
+    raise newException(ValueError, "unsupported architecture: " & hp.arch)
+  if cache.curLen >= cache.maxLen:
+    raise newException(ValueError, "KV cache full")
+  let headDim = hp.nEmb div hp.nHead
+  let ropeDim = if hp.ropeDim > 0: hp.ropeDim else: headDim
+
+  let tokEmb = getTensorOr(m, "tok_embeddings.weight", "token_embd.weight")
+  var x = embeddingLookup(tokEmb, @[token], hp.nVocab, hp.nEmb)
+  let pos = cache.curLen
+
+  for layer in 0 ..< hp.nLayer:
+    let attnNorm = m.getTensor("blk." & $layer & ".attn_norm.weight")
+    let ffnNorm = m.getTensor("blk." & $layer & ".ffn_norm.weight")
+    let wq = m.getTensor("blk." & $layer & ".attn_q.weight")
+    let wk = m.getTensor("blk." & $layer & ".attn_k.weight")
+    let wv = m.getTensor("blk." & $layer & ".attn_v.weight")
+    let wo = m.getTensor("blk." & $layer & ".attn_output.weight")
+    let wGate = m.getTensor("blk." & $layer & ".ffn_gate.weight")
+    let wUp = m.getTensor("blk." & $layer & ".ffn_up.weight")
+    let wDown = m.getTensor("blk." & $layer & ".ffn_down.weight")
+
+    let xNorm = rmsnormCols(x, attnNorm, hp.rmsEps)
+    var q = linearGGMLCol(xNorm, wq)
+    var k = linearGGMLCol(xNorm, wk)
+    let v = linearGGMLCol(xNorm, wv)
+    applyRopeAtPos(q, hp.nHead, headDim, ropeDim, hp.ropeFreqBase, pos)
+    applyRopeAtPos(k, hp.nHeadKv, headDim, ropeDim, hp.ropeFreqBase, pos)
+    storeKVRange(cache, layer, pos, k, v)
+    let attnCtx = attentionCached(q, cache.k[layer], cache.v[layer], pos + 1, hp.nHead, hp.nHeadKv, headDim)
+    let attnOut = linearGGMLCol(attnCtx, wo)
+    x = add(x, attnOut)
+
+    let xNorm2 = rmsnormCols(x, ffnNorm, hp.rmsEps)
+    let ffnOut = ffn(xNorm2, wGate, wUp, wDown)
+    x = add(x, ffnOut)
+
+  cache.curLen = pos + 1
+  let norm = getTensorOr(m, "norm.weight", "output_norm.weight")
+  let outW = getTensorAny(m, ["output.weight", "token_embd.weight", "tok_embeddings.weight"])
+  let xNormFinal = rmsnormCols(x, norm, hp.rmsEps)
+  result = linearOut(xNormFinal, outW, hp.nEmb, hp.nVocab)
+
+proc initCpuForwardRelays*() =
+  initKvCacheRelay = initKvCacheCpu
+  forwardPrefillRelay = forwardPrefillCpu
+  forwardDecodeRelay = forwardDecodeCpu
+  forwardRelaysInitialized = true
+
+when defined(useHippo):
+  proc initHippoForwardRelays*() =
+    initKvCacheRelay = initKvCacheHippo
+    forwardPrefillRelay = forwardPrefillHippo
+    forwardDecodeRelay = forwardDecodeHippo
+    forwardRelaysInitialized = true
+
+when defined(useSycl):
+  proc initSyclForwardRelays*() =
+    initKvCacheRelay = initKvCacheSycl
+    forwardPrefillRelay = forwardPrefillSycl
+    forwardDecodeRelay = forwardDecodeSycl
+    forwardRelaysInitialized = true
+
+proc ensureForwardRelays() =
+  if not forwardRelaysInitialized:
+    when defined(useHippo):
+      initHippoForwardRelays()
+    elif defined(useSycl):
+      initSyclForwardRelays()
+    else:
+      initCpuForwardRelays()
+
+proc initKvCache*(hp: HParams, maxLen: int): KvCache =
+  ensureForwardRelays()
+  initKvCacheRelay(hp, maxLen)
+
 proc forwardPrefill*(m: var Model, tokens: seq[int32], cache: var KvCache): Tensor =
-  when defined(useHippo):
-    return forwardPrefillHippo(m, tokens, cache)
-  else:
-    let hp = m.hparams
-    if not isSupportedArch(hp.arch):
-      raise newException(ValueError, "unsupported architecture: " & hp.arch)
-    if hp.nHeadKv != 0 and (hp.nHead mod hp.nHeadKv) != 0:
-      raise newException(ValueError, "GQA requires head_count divisible by head_count_kv")
-    let headDim = hp.nEmb div hp.nHead
-    let ropeDim = if hp.ropeDim > 0: hp.ropeDim else: headDim
-
-    let tokEmb = getTensorOr(m, "tok_embeddings.weight", "token_embd.weight")
-    var x = embeddingLookup(tokEmb, tokens, hp.nVocab, hp.nEmb)
-    cache.curLen = tokens.len
-
-    for layer in 0 ..< hp.nLayer:
-      let attnNorm = m.getTensor("blk." & $layer & ".attn_norm.weight")
-      let ffnNorm = m.getTensor("blk." & $layer & ".ffn_norm.weight")
-      let wq = m.getTensor("blk." & $layer & ".attn_q.weight")
-      let wk = m.getTensor("blk." & $layer & ".attn_k.weight")
-      let wv = m.getTensor("blk." & $layer & ".attn_v.weight")
-      let wo = m.getTensor("blk." & $layer & ".attn_output.weight")
-      let wGate = m.getTensor("blk." & $layer & ".ffn_gate.weight")
-      let wUp = m.getTensor("blk." & $layer & ".ffn_up.weight")
-      let wDown = m.getTensor("blk." & $layer & ".ffn_down.weight")
-
-      let xNorm = rmsnormCols(x, attnNorm, hp.rmsEps)
-      var q = linearGGMLCol(xNorm, wq)
-      var k = linearGGMLCol(xNorm, wk)
-      let v = linearGGMLCol(xNorm, wv)
-      applyRopeSingle(q, hp.nHead, headDim, ropeDim, hp.ropeFreqBase)
-      applyRopeSingle(k, hp.nHeadKv, headDim, ropeDim, hp.ropeFreqBase)
-      storeKVRange(cache, layer, 0, k, v)
-      let attnOut = attentionFull(q, k, v, wo, hp.nHead, hp.nHeadKv, headDim)
-      x = add(x, attnOut)
-
-      let xNorm2 = rmsnormCols(x, ffnNorm, hp.rmsEps)
-      let ffnOut = ffn(xNorm2, wGate, wUp, wDown)
-      x = add(x, ffnOut)
-
-    let norm = getTensorOr(m, "norm.weight", "output_norm.weight")
-    let outW = getTensorAny(m, ["output.weight", "token_embd.weight", "tok_embeddings.weight"])
-    let xNormFinal = rmsnormCols(x, norm, hp.rmsEps)
-    result = linearOut(xNormFinal, outW, hp.nEmb, hp.nVocab)
+  ensureForwardRelays()
+  forwardPrefillRelay(m, tokens, cache)
 
 proc forwardDecode*(m: var Model, token: int32, cache: var KvCache): Tensor =
-  when defined(useHippo):
-    return forwardDecodeHippo(m, token, cache)
-  else:
-    let hp = m.hparams
-    if not isSupportedArch(hp.arch):
-      raise newException(ValueError, "unsupported architecture: " & hp.arch)
-    if cache.curLen >= cache.maxLen:
-      raise newException(ValueError, "KV cache full")
-    let headDim = hp.nEmb div hp.nHead
-    let ropeDim = if hp.ropeDim > 0: hp.ropeDim else: headDim
-
-    let tokEmb = getTensorOr(m, "tok_embeddings.weight", "token_embd.weight")
-    var x = embeddingLookup(tokEmb, @[token], hp.nVocab, hp.nEmb)
-    let pos = cache.curLen
-
-    for layer in 0 ..< hp.nLayer:
-      let attnNorm = m.getTensor("blk." & $layer & ".attn_norm.weight")
-      let ffnNorm = m.getTensor("blk." & $layer & ".ffn_norm.weight")
-      let wq = m.getTensor("blk." & $layer & ".attn_q.weight")
-      let wk = m.getTensor("blk." & $layer & ".attn_k.weight")
-      let wv = m.getTensor("blk." & $layer & ".attn_v.weight")
-      let wo = m.getTensor("blk." & $layer & ".attn_output.weight")
-      let wGate = m.getTensor("blk." & $layer & ".ffn_gate.weight")
-      let wUp = m.getTensor("blk." & $layer & ".ffn_up.weight")
-      let wDown = m.getTensor("blk." & $layer & ".ffn_down.weight")
-
-      let xNorm = rmsnormCols(x, attnNorm, hp.rmsEps)
-      var q = linearGGMLCol(xNorm, wq)
-      var k = linearGGMLCol(xNorm, wk)
-      let v = linearGGMLCol(xNorm, wv)
-      applyRopeAtPos(q, hp.nHead, headDim, ropeDim, hp.ropeFreqBase, pos)
-      applyRopeAtPos(k, hp.nHeadKv, headDim, ropeDim, hp.ropeFreqBase, pos)
-      storeKVRange(cache, layer, pos, k, v)
-      let attnCtx = attentionCached(q, cache.k[layer], cache.v[layer], pos + 1, hp.nHead, hp.nHeadKv, headDim)
-      let attnOut = linearGGMLCol(attnCtx, wo)
-      x = add(x, attnOut)
-
-      let xNorm2 = rmsnormCols(x, ffnNorm, hp.rmsEps)
-      let ffnOut = ffn(xNorm2, wGate, wUp, wDown)
-      x = add(x, ffnOut)
-
-    cache.curLen = pos + 1
-    let norm = getTensorOr(m, "norm.weight", "output_norm.weight")
-    let outW = getTensorAny(m, ["output.weight", "token_embd.weight", "tok_embeddings.weight"])
-    let xNormFinal = rmsnormCols(x, norm, hp.rmsEps)
-    result = linearOut(xNormFinal, outW, hp.nEmb, hp.nVocab)
+  ensureForwardRelays()
+  forwardDecodeRelay(m, token, cache)
