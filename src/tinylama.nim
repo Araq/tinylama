@@ -44,11 +44,18 @@ proc main() =
   let nVocab = m.hparams.nVocab
 
   var allTokens: seq[int32] = @[]
-  var cache = initKvCache(m.hparams, max(32, maxNew + 32))
+  var cache: KvCache
+  var cacheInit = false
+
+  proc ensureCacheCapacity(needed: int) =
+    if not cacheInit or needed > cache.maxLen:
+      cache = initKvCache(m.hparams, max(64, needed))
+      cacheInit = true
 
   proc runPrompt(line: string) =
     let tokens = encodePromptTokens(vocab, line)
     allTokens.add(tokens)
+    ensureCacheCapacity(allTokens.len + maxNew + 32)
 
     if cache.curLen == 0:
       if showProgress: stderr.write("prefill... ")

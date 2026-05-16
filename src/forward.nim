@@ -1,7 +1,7 @@
 ## Forward pass: CPU backends + compile-time dispatch to GPU backends.
 
 import
-  std/[math],
+  std/[math, tables],
   ./[forward_types, model, tensor]
 
 export forward_types
@@ -15,9 +15,12 @@ when defined(useMalebolgia):
 when defined(useHippo):
   import ./forward_hippo
 
+proc isSupportedArch(arch: string): bool =
+  arch.len == 0 or arch == "llama" or arch == "qwen2"
+
 proc initKvCache*(hp: HParams, maxLen: int): KvCache =
   if hp.nHead <= 0:
-    raise newException(ValueError, "KV cache requires llama-style head_count")
+    raise newException(ValueError, "KV cache requires attention head_count")
   result.maxLen = maxLen
   result.curLen = 0
   result.nHeadKv = hp.nHeadKv
@@ -36,6 +39,13 @@ proc getTensorOr(m: var Model, a, b: string): Tensor =
     return m.getTensor(a)
   except KeyError:
     return m.getTensor(b)
+
+proc getTensorAny(m: var Model, names: openArray[string]): Tensor =
+  for n in names:
+    let info = m.infos.getOrDefault(n)
+    if info.name.len != 0:
+      return m.getTensor(n)
+  raise newException(KeyError, "missing tensor: none of the candidate names exist")
 
 proc embeddingLookup(weight: Tensor, tokens: seq[int32], nVocab, nEmb: int): Tensor =
   ## Returns [nEmb, seq] in ggml-style column layout.
@@ -250,7 +260,7 @@ proc forwardPrefill*(m: var Model, tokens: seq[int32], cache: var KvCache): Tens
     return forwardPrefillHippo(m, tokens, cache)
   else:
     let hp = m.hparams
-    if hp.arch != "" and hp.arch != "llama":
+    if not isSupportedArch(hp.arch):
       raise newException(ValueError, "unsupported architecture: " & hp.arch)
     if hp.nHeadKv != 0 and (hp.nHead mod hp.nHeadKv) != 0:
       raise newException(ValueError, "GQA requires head_count divisible by head_count_kv")
@@ -287,7 +297,7 @@ proc forwardPrefill*(m: var Model, tokens: seq[int32], cache: var KvCache): Tens
       x = add(x, ffnOut)
 
     let norm = getTensorOr(m, "norm.weight", "output_norm.weight")
-    let outW = m.getTensor("output.weight")
+    let outW = getTensorAny(m, ["output.weight", "token_embd.weight", "tok_embeddings.weight"])
     let xNormFinal = rmsnormCols(x, norm, hp.rmsEps)
     result = linearOut(xNormFinal, outW, hp.nEmb, hp.nVocab)
 
@@ -296,7 +306,7 @@ proc forwardDecode*(m: var Model, token: int32, cache: var KvCache): Tensor =
     return forwardDecodeHippo(m, token, cache)
   else:
     let hp = m.hparams
-    if hp.arch != "" and hp.arch != "llama":
+    if not isSupportedArch(hp.arch):
       raise newException(ValueError, "unsupported architecture: " & hp.arch)
     if cache.curLen >= cache.maxLen:
       raise newException(ValueError, "KV cache full")
@@ -335,6 +345,6 @@ proc forwardDecode*(m: var Model, token: int32, cache: var KvCache): Tensor =
 
     cache.curLen = pos + 1
     let norm = getTensorOr(m, "norm.weight", "output_norm.weight")
-    let outW = m.getTensor("output.weight")
+    let outW = getTensorAny(m, ["output.weight", "token_embd.weight", "tok_embeddings.weight"])
     let xNormFinal = rmsnormCols(x, norm, hp.rmsEps)
     result = linearOut(xNormFinal, outW, hp.nEmb, hp.nVocab)
