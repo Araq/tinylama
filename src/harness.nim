@@ -39,6 +39,13 @@ proc findNimony(): string =
   if fileExists(guess): return guess
   result = ""
 
+proc resetContext(h: var Harness) =
+  ## Drop the KV cache so a compacted conversation can be re-prefilled;
+  ## prefill rewrites the cache from position 0 on both backends.
+  h.cache.curLen = 0
+  h.history.setLen 0
+  h.hasPending = false
+
 proc feedTokens(h: var Harness, tokens: seq[int32]): Tensor =
   ## Append tokens to the context; returns the logits of the last position.
   if h.cache.curLen + tokens.len + h.maxNew > h.cache.maxLen:
@@ -100,7 +107,21 @@ proc runTask(h: var Harness, task: string, maxTurns: int,
   for turn in 1 .. maxTurns:
     if h.verbose:
       stderr.writeLine "--- feeding chunk ---\n" & chunk & "\n---"
-    let tokens = tokenizeWithSpecial(h.vocab, chunk, addSpecial = firstChunk)
+    var tokens = tokenizeWithSpecial(h.vocab, chunk, addSpecial = firstChunk)
+    if h.cache.curLen + tokens.len + h.maxNew > h.cache.maxLen:
+      # The next chunk would leave no room to generate: elide old tool
+      # results and re-prefill the rebuilt conversation from scratch.
+      for keepRecent in [2, 1, 0]:
+        if elideOldToolResults(messages, keepRecent):
+          h.resetContext()
+          chunk = renderChatML(messages)
+          tokens = tokenizeWithSpecial(h.vocab, chunk, addSpecial = true)
+          if h.cache.curLen + tokens.len + h.maxNew <= h.cache.maxLen: break
+      if h.cache.curLen + tokens.len + h.maxNew > h.cache.maxLen:
+        quit "context window exhausted (" & $h.cache.maxLen &
+             " tokens) even after eliding old tool results; retry with a larger --ctx"
+      stderr.writeLine "[ctx] compacted conversation; re-prefilling " &
+        $tokens.len & " tokens"
     firstChunk = false
     let logits = feedTokens(h, tokens)
 

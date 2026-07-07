@@ -39,6 +39,22 @@ proc renderChatML*(messages: openArray[ChatMessage],
   if addGenerationPrompt:
     result.add "<|im_start|>assistant\n"
 
+const elidedToolResult* = "(older tool result elided to save context)"
+
+proc elideOldToolResults*(messages: var seq[ChatMessage],
+                          keepRecent: int): bool =
+  ## Blanks all but the most recent `keepRecent` tool results so a
+  ## conversation that outgrew the context window can be re-prefilled
+  ## smaller. Returns true when anything changed.
+  result = false
+  var seen = 0
+  for i in countdown(messages.high, 0):
+    if messages[i].role == roleTool:
+      inc seen
+      if seen > keepRecent and messages[i].content != elidedToolResult:
+        messages[i].content = elidedToolResult
+        result = true
+
 proc stopTokenIds*(v: Vocab): seq[int32] =
   ## Token ids that end an assistant turn.
   result = @[v.eosId]
