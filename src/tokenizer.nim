@@ -132,16 +132,24 @@ proc loadVocab*(g: GgufFile): Vocab =
   var addSpacePrefix = true
   let hasAddBos = g.getKvBool(tokenAddBosKey, addBos)
   discard g.getKvBool(tokenAddEosKey, addEos)
-  discard g.getKvBool(tokenAddPrefixKey, addSpacePrefix)
+  let hasAddPrefix = g.getKvBool(tokenAddPrefixKey, addSpacePrefix)
+  if modelType == "gpt2" and not hasAddPrefix:
+    addSpacePrefix = false
   if modelType == "llama" and not hasAddBos:
     addBos = true
 
   var bosId: int32 = 1
   var eosId: int32 = 2
   var unkId: int32 = 0
-  discard g.getKvI32(tokenBosIdKey, bosId)
-  discard g.getKvI32(tokenEosIdKey, eosId)
-  discard g.getKvI32(tokenUnkIdKey, unkId)
+  proc getTokenId(g: GgufFile, key: string, value: var int32) =
+    # token ids are written as u32 by most converters, as i32 by some
+    if not g.getKvI32(key, value):
+      var u: uint32
+      if g.getKvU32(key, u):
+        value = int32(u)
+  getTokenId(g, tokenBosIdKey, bosId)
+  getTokenId(g, tokenEosIdKey, eosId)
+  getTokenId(g, tokenUnkIdKey, unkId)
 
   result.modelType = modelType
   result.addBos = addBos
@@ -324,6 +332,12 @@ proc tokenize*(v: Vocab, text: string, addSpecial = true): seq[int32] =
   if addSpecial and v.addEos:
     result.add(v.eosId)
 
+proc tokenizeSegment(v: Vocab, text: string): seq[int32] =
+  if v.modelType == "gpt2":
+    tokenizeGpt2Bytes(v, text)
+  else:
+    tokenizeSpm(v, text)
+
 proc tokenizeWithSpecial*(v: Vocab, text: string, addSpecial = true): seq[int32] =
   var specials = @[
     "<|user|>", "<|assistant|>", "<|system|>",
@@ -345,10 +359,10 @@ proc tokenizeWithSpecial*(v: Vocab, text: string, addSpecial = true): seq[int32]
         bestIdx = i
         bestTok = s
     if bestIdx == -1:
-      outTokens.add(tokenizeSpm(v, text.substr(pos)))
+      outTokens.add(tokenizeSegment(v, text.substr(pos)))
       break
     if bestIdx > pos:
-      outTokens.add(tokenizeSpm(v, text.substr(pos, bestIdx - 1)))
+      outTokens.add(tokenizeSegment(v, text.substr(pos, bestIdx - 1)))
     outTokens.add(int32(v.tokenToId[bestTok]))
     pos = bestIdx + bestTok.len
 
