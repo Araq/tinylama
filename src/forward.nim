@@ -120,14 +120,19 @@ proc linearGGMLCol(x: Tensor, w: Tensor): Tensor =
           acc += w.data[wRow + k] * x.data[k * seqLen + s]
         result.data[outRow + s] = acc
 
-proc applyRopeSingle(x: var Tensor, nHead, headDim, ropeDim: int, base: float32) =
+proc applyRopeSingle(x: var Tensor, nHead, headDim, ropeDim: int, base: float32, neox: bool) =
   let seqLen = x.shape[1]
+  let half = ropeDim div 2
   for h in 0 ..< nHead:
     let hOffset = h * headDim
     for p in 0 ..< seqLen:
-      for i in 0 ..< ropeDim div 2:
-        let idx0 = (hOffset + 2 * i) * seqLen + p
-        let idx1 = (hOffset + 2 * i + 1) * seqLen + p
+      for i in 0 ..< half:
+        # NEOX style (qwen2 etc.) pairs dimension i with i + ropeDim/2;
+        # normal style (llama) rotates adjacent pairs.
+        let d0 = if neox: hOffset + i else: hOffset + 2 * i
+        let d1 = if neox: hOffset + half + i else: hOffset + 2 * i + 1
+        let idx0 = d0 * seqLen + p
+        let idx1 = d1 * seqLen + p
         let theta = pow(1.0'f32 / base, float32(2 * i) / float32(ropeDim))
         let angle = float32(p) * theta
         let c = cos(angle)
@@ -137,13 +142,16 @@ proc applyRopeSingle(x: var Tensor, nHead, headDim, ropeDim: int, base: float32)
         x.data[idx0] = v0 * c - v1 * s
         x.data[idx1] = v0 * s + v1 * c
 
-proc applyRopeAtPos(x: var Tensor, nHead, headDim, ropeDim: int, base: float32, pos: int) =
+proc applyRopeAtPos(x: var Tensor, nHead, headDim, ropeDim: int, base: float32, pos: int, neox: bool) =
   let seqLen = x.shape[1]
+  let half = ropeDim div 2
   for h in 0 ..< nHead:
     let hOffset = h * headDim
-    for i in 0 ..< ropeDim div 2:
-      let idx0 = (hOffset + 2 * i) * seqLen
-      let idx1 = (hOffset + 2 * i + 1) * seqLen
+    for i in 0 ..< half:
+      let d0 = if neox: hOffset + i else: hOffset + 2 * i
+      let d1 = if neox: hOffset + half + i else: hOffset + 2 * i + 1
+      let idx0 = d0 * seqLen
+      let idx1 = d1 * seqLen
       let theta = pow(1.0'f32 / base, float32(2 * i) / float32(ropeDim))
       let angle = float32(pos) * theta
       let c = cos(angle)
@@ -225,6 +233,20 @@ proc attentionCached(q: Tensor, kCache, vCache: Tensor, curLen, nHead, nHeadKv, 
       ctx.data[outIdx] = acc
   ctx
 
+proc addBiasCols(x: var Tensor, bias: Tensor) =
+  ## x is [dim, seqLen]; bias is [dim].
+  let dim = x.shape[0]
+  let seqLen = x.shape[1]
+  for o in 0 ..< dim:
+    let b = bias.data[o]
+    for s in 0 ..< seqLen:
+      x.data[o * seqLen + s] += b
+
+proc addBiasIfPresent(m: var Model, x: var Tensor, name: string) =
+  ## Qwen2-style models carry biases on the q/k/v projections.
+  if m.infos.hasKey(name):
+    addBiasCols(x, m.getTensor(name))
+
 proc ffn(x: Tensor, wGate, wUp, wDown: Tensor): Tensor =
   let gate = linearGGMLCol(x, wGate)
   let up = linearGGMLCol(x, wUp)
@@ -266,6 +288,7 @@ proc forwardPrefill*(m: var Model, tokens: seq[int32], cache: var KvCache): Tens
       raise newException(ValueError, "GQA requires head_count divisible by head_count_kv")
     let headDim = hp.nEmb div hp.nHead
     let ropeDim = if hp.ropeDim > 0: hp.ropeDim else: headDim
+    let ropeNeox = hp.arch == "qwen2"
 
     let tokEmb = getTensorOr(m, "tok_embeddings.weight", "token_embd.weight")
     var x = embeddingLookup(tokEmb, tokens, hp.nVocab, hp.nEmb)
@@ -285,9 +308,12 @@ proc forwardPrefill*(m: var Model, tokens: seq[int32], cache: var KvCache): Tens
       let xNorm = rmsnormCols(x, attnNorm, hp.rmsEps)
       var q = linearGGMLCol(xNorm, wq)
       var k = linearGGMLCol(xNorm, wk)
-      let v = linearGGMLCol(xNorm, wv)
-      applyRopeSingle(q, hp.nHead, headDim, ropeDim, hp.ropeFreqBase)
-      applyRopeSingle(k, hp.nHeadKv, headDim, ropeDim, hp.ropeFreqBase)
+      var v = linearGGMLCol(xNorm, wv)
+      addBiasIfPresent(m, q, "blk." & $layer & ".attn_q.bias")
+      addBiasIfPresent(m, k, "blk." & $layer & ".attn_k.bias")
+      addBiasIfPresent(m, v, "blk." & $layer & ".attn_v.bias")
+      applyRopeSingle(q, hp.nHead, headDim, ropeDim, hp.ropeFreqBase, ropeNeox)
+      applyRopeSingle(k, hp.nHeadKv, headDim, ropeDim, hp.ropeFreqBase, ropeNeox)
       storeKVRange(cache, layer, 0, k, v)
       let attnOut = attentionFull(q, k, v, wo, hp.nHead, hp.nHeadKv, headDim)
       x = add(x, attnOut)
@@ -312,6 +338,7 @@ proc forwardDecode*(m: var Model, token: int32, cache: var KvCache): Tensor =
       raise newException(ValueError, "KV cache full")
     let headDim = hp.nEmb div hp.nHead
     let ropeDim = if hp.ropeDim > 0: hp.ropeDim else: headDim
+    let ropeNeox = hp.arch == "qwen2"
 
     let tokEmb = getTensorOr(m, "tok_embeddings.weight", "token_embd.weight")
     var x = embeddingLookup(tokEmb, @[token], hp.nVocab, hp.nEmb)
@@ -331,9 +358,12 @@ proc forwardDecode*(m: var Model, token: int32, cache: var KvCache): Tensor =
       let xNorm = rmsnormCols(x, attnNorm, hp.rmsEps)
       var q = linearGGMLCol(xNorm, wq)
       var k = linearGGMLCol(xNorm, wk)
-      let v = linearGGMLCol(xNorm, wv)
-      applyRopeAtPos(q, hp.nHead, headDim, ropeDim, hp.ropeFreqBase, pos)
-      applyRopeAtPos(k, hp.nHeadKv, headDim, ropeDim, hp.ropeFreqBase, pos)
+      var v = linearGGMLCol(xNorm, wv)
+      addBiasIfPresent(m, q, "blk." & $layer & ".attn_q.bias")
+      addBiasIfPresent(m, k, "blk." & $layer & ".attn_k.bias")
+      addBiasIfPresent(m, v, "blk." & $layer & ".attn_v.bias")
+      applyRopeAtPos(q, hp.nHead, headDim, ropeDim, hp.ropeFreqBase, pos, ropeNeox)
+      applyRopeAtPos(k, hp.nHeadKv, headDim, ropeDim, hp.ropeFreqBase, pos, ropeNeox)
       storeKVRange(cache, layer, pos, k, v)
       let attnCtx = attentionCached(q, cache.k[layer], cache.v[layer], pos + 1, hp.nHead, hp.nHeadKv, headDim)
       let attnOut = linearGGMLCol(attnCtx, wo)

@@ -188,21 +188,26 @@ proc main() =
     var cache = cloneCache(decodeBase)
     discard forwardDecode(m, firstGenerated, cache)
 
-  # Validate output correctness against known-good reference (8 decode steps)
+  # Validate output correctness against known-good reference (8 decode steps).
+  # The reference tokens are specific to the tinyllama Q2_K model; for other
+  # models just print the greedy output for eyeballing.
   block:
     let validationTokens = runDecodeSteps(m, decodeBase, firstGenerated, nVocab, 8)
     let text = detokenize(vocab, @[firstGenerated] & validationTokens)
     echo "generated: ", text
-    if firstGenerated != ExpectedFirstToken:
-      echo "VALIDATION FAILED: firstGenerated = ", firstGenerated, ", expected ", ExpectedFirstToken
-      quit(1)
-    for i in 0 ..< 8:
-      if validationTokens[i] != ExpectedTokens[i]:
-        echo "VALIDATION FAILED at token ", i, ": got ", validationTokens[i], ", expected ", ExpectedTokens[i]
-        echo "  full expected: ", ExpectedTokens
-        echo "  full got:      ", validationTokens
+    if m.hparams.arch == "llama" and nVocab == 32000:
+      if firstGenerated != ExpectedFirstToken:
+        echo "VALIDATION FAILED: firstGenerated = ", firstGenerated, ", expected ", ExpectedFirstToken
         quit(1)
-    echo "output validation passed"
+      for i in 0 ..< 8:
+        if validationTokens[i] != ExpectedTokens[i]:
+          echo "VALIDATION FAILED at token ", i, ": got ", validationTokens[i], ", expected ", ExpectedTokens[i]
+          echo "  full expected: ", ExpectedTokens
+          echo "  full got:      ", validationTokens
+          quit(1)
+      echo "output validation passed"
+    else:
+      echo "output validation skipped (reference tokens are tinyllama-specific)"
 
   echo "warming decode benchmark..."
   for _ in 0 ..< decodeWarmup:

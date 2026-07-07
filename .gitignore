@@ -3,3 +3,15 @@ models/
 # Local binaries
 src/tinylama
 bench/bench_tinylama
+src/harness
+tests/tester
+tests/tharness
+bin_harness
+bin_tinylama
+tests/thippo_kernels
+bin_tinylama_mb
+bin_bench
+src/harness_gpu
+bin_harness_gpu
+bin_tinylama_gpu
+bin_bench_gpu
